@@ -12,6 +12,13 @@ import redis
 from datetime import datetime, timedelta
 from typing import Dict, List, Set
 import threading
+import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'utils'))
+from ist_utils import (
+    get_ist_now, get_ist_timestamp, get_ist_timestamp_int, 
+    format_ist_for_redis, get_ist_market_status, is_market_open
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -79,7 +86,7 @@ class RedisTradingApp:
         
         # Store connection status in Redis
         self.redis_client.setex("websocket_status", 60, "connected")
-        self.redis_client.set("last_connection_time", datetime.now().isoformat())
+        self.redis_client.set("last_connection_time", format_ist_for_redis())
     
     def _on_message(self, message):
         """Process market data messages with Redis caching"""
@@ -99,7 +106,7 @@ class RedisTradingApp:
                                     'ltp': ltpc.get('ltp', 0),
                                     'ltt': ltpc.get('ltt', ''),
                                     'change_percent': ltpc.get('cp', 0),
-                                    'timestamp': datetime.now().isoformat(),
+                                    'timestamp': format_ist_for_redis(),
                                     'ohlc': index_data.get('marketOHLC', {})
                                 }
                                 
@@ -149,7 +156,7 @@ class RedisTradingApp:
             # Update instrument stats
             stats_key = f"instrument_stats:{instrument_key}"
             stats = {
-                'last_update': datetime.now().isoformat(),
+                'last_update': format_ist_for_redis(),
                 'ltp': data['ltp'],
                 'change_percent': data['change_percent'],
                 'subscriber_count': len(self.redis_client.smembers(f"subscribers:{instrument_key}"))
@@ -169,12 +176,12 @@ class RedisTradingApp:
                     'signal': 'BUY',
                     'price': ltp,
                     'confidence': min(change_percent / 2.0, 1.0),
-                    'timestamp': datetime.now().isoformat(),
+                    'timestamp': format_ist_for_redis(),
                     'strategy': 'momentum'
                 }
                 
                 # Store signal in Redis
-                signal_key = f"signal:{instrument_key}:{int(time.time())}"
+                signal_key = f"signal:{instrument_key}:{get_ist_timestamp_int()}"
                 self.redis_client.setex(signal_key, 300, json.dumps(signal))  # 5-minute TTL
                 
                 # Add to signals queue
@@ -189,12 +196,12 @@ class RedisTradingApp:
                     'signal': 'SELL',
                     'price': ltp,
                     'confidence': min(abs(change_percent) / 2.0, 1.0),
-                    'timestamp': datetime.now().isoformat(),
+                    'timestamp': format_ist_for_redis(),
                     'strategy': 'momentum'
                 }
                 
                 # Store signal in Redis
-                signal_key = f"signal:{instrument_key}:{int(time.time())}"
+                signal_key = f"signal:{instrument_key}:{get_ist_timestamp_int()}"
                 self.redis_client.setex(signal_key, 300, json.dumps(signal))
                 
                 # Add to signals queue
@@ -221,7 +228,7 @@ class RedisTradingApp:
         
         # Update Redis status
         self.redis_client.setex("websocket_status", 60, "disconnected")
-        self.redis_client.set("last_disconnection_time", datetime.now().isoformat())
+        self.redis_client.set("last_disconnection_time", format_ist_for_redis())
     
     def add_client(self, client_id: str, instruments: List[str]):
         """Add a new client and subscribe to instruments"""
@@ -229,7 +236,7 @@ class RedisTradingApp:
             # Store client info
             self.redis_client.hset(f"client:{client_id}", mapping={
                 "instruments": json.dumps(instruments),
-                "created_at": datetime.now().isoformat(),
+                "created_at": format_ist_for_redis(),
                 "status": "active"
             })
             
@@ -322,6 +329,14 @@ class RedisTradingApp:
 def main():
     """Main application"""
     print("🚀 Starting Redis-Enhanced Trading Application")
+    
+    # Display IST market status
+    market_status = get_ist_market_status()
+    print(f"🕐 Current IST Time: {market_status['current_time_ist']}")
+    print(f"📈 Market Status: {'OPEN' if market_status['is_market_open'] else 'CLOSED'}")
+    print(f"🌍 Timezone: {market_status['timezone']}")
+    if not market_status['is_market_open']:
+        print(f"⏰ Next Market Open: {market_status['market_open_time']}")
     
     # Your access token
     access_token = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI0WEJNVlAiLCJqdGkiOiI2OGZjOTg0NDZmYzliMzVhNWEwNTBjZjYiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaWF0IjoxNzYxMzg0NTE2LCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3NjE0Mjk2MDB9.PTgxNla1ZG9zJETfv4ygrem-p60IDAwC5IQPXKS-KmE"
