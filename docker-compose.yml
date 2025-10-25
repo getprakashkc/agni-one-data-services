@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+
+  data-service:
+    build: .
+    ports:
+      - "8001:8001"
+    environment:
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - redis
+    volumes:
+      - ./data_service.py:/app/data_service.py
+    command: python data_service.py
+
+  trading-service:
+    build: .
+    ports:
+      - "8002:8002"
+    environment:
+      - DATA_SERVICE_URL=http://data-service:8001
+    depends_on:
+      - data-service
+    volumes:
+      - ./trading_service.py:/app/trading_service.py
+    command: python trading_service.py
+
+  trading-app:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - DATA_SERVICE_URL=http://data-service:8001
+      - TRADING_SERVICE_URL=http://trading-service:8002
+    depends_on:
+      - data-service
+      - trading-service
+    volumes:
+      - ./trading_app.py:/app/trading_app.py
+    command: python trading_app.py
+
+volumes:
+  redis_data:

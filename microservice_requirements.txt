@@ -1,0 +1,21 @@
+# Data Service Requirements
+upstox-python-sdk>=2.18.0
+fastapi>=0.104.0
+uvicorn>=0.24.0
+websockets>=12.0
+redis>=5.0.0
+python-multipart>=0.0.6
+
+# Trading Service Requirements
+fastapi>=0.104.0
+uvicorn>=0.24.0
+websockets>=12.0
+requests>=2.31.0
+
+# Trading App Requirements
+fastapi>=0.104.0
+uvicorn>=0.24.0
+websockets>=12.0
+requests>=2.31.0
+jinja2>=3.1.0
+python-multipart>=0.0.6
