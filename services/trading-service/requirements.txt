@@ -1,0 +1,15 @@
+# Trading Service Requirements
+# Core dependencies for trading strategy execution
+
+# Web framework
+fastapi>=0.100.0
+uvicorn>=0.20.0
+
+# HTTP requests
+requests>=2.28.0
+
+# WebSocket client
+websockets>=11.0
+
+# Timezone handling
+pytz>=2023.3

@@ -1,0 +1,22 @@
+# Data Service Requirements
+# Core dependencies for market data streaming
+
+# Upstox Python SDK
+upstox-python-sdk>=2.18.0
+
+# WebSocket and networking
+websocket-client>=1.0.0
+requests>=2.28.0
+
+# Data processing
+protobuf>=3.0.0
+
+# Database and caching
+redis>=4.0.0
+
+# Timezone handling
+pytz>=2023.3
+
+# Web framework
+fastapi>=0.100.0
+uvicorn>=0.20.0
