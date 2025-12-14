@@ -1,0 +1,116 @@
+# Coolify Configuration for Agnidata Trading Services
+# Each service is configured as a separate resource with watch paths
+
+version: '3.8'
+
+services:
+  # Token Service - Port 8000
+  token-service:
+    build:
+      context: .
+      dockerfile: services/token-service/Dockerfile
+    environment:
+      - REDIS_HOST=${REDIS_HOST:-redis}
+      - REDIS_PORT=${REDIS_PORT:-6379}
+      - INTERNAL_API_BASE_URL=${INTERNAL_API_BASE_URL:-http://192.168.1.206:9000}
+      - INTERNAL_API_ACCOUNT_ID=${INTERNAL_API_ACCOUNT_ID:-agnidata001}
+      - TOKEN_SERVICE_PORT=8000
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    # Watch Path: services/token-service/**
+
+  # Data Service - Port 8001
+  data-service:
+    build:
+      context: .
+      dockerfile: services/data-service/Dockerfile
+    environment:
+      - REDIS_HOST=${REDIS_HOST:-redis}
+      - REDIS_PORT=${REDIS_PORT:-6379}
+      - UPSTOX_ACCESS_TOKEN=${UPSTOX_ACCESS_TOKEN:-}
+      - DATA_SERVICE_PORT=8001
+    ports:
+      - "8001:8001"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    depends_on:
+      - redis
+      - token-service
+    # Watch Path: services/data-service/**
+
+  # Trading Service - Port 8002
+  trading-service:
+    build:
+      context: .
+      dockerfile: services/trading-service/Dockerfile
+    environment:
+      - DATA_SERVICE_URL=${DATA_SERVICE_URL:-http://data-service:8001}
+      - TRADING_SERVICE_PORT=8002
+    ports:
+      - "8002:8002"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    depends_on:
+      - data-service
+    # Watch Path: services/trading-service/**
+
+  # Trading App - Port 8003
+  trading-app:
+    build:
+      context: .
+      dockerfile: services/trading-app/Dockerfile
+    environment:
+      - DATA_SERVICE_URL=${DATA_SERVICE_URL:-http://data-service:8001}
+      - TRADING_SERVICE_URL=${TRADING_SERVICE_URL:-http://trading-service:8002}
+      - TRADING_APP_PORT=8003
+    ports:
+      - "8003:8003"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    depends_on:
+      - data-service
+      - trading-service
+    # Watch Path: services/trading-app/**
+
+  # Redis Database
+  redis:
+    image: redis:7-alpine
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    # Watch Path: shared/**
+
+volumes:
+  redis_data:
+    driver: local

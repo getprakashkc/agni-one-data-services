@@ -4,6 +4,11 @@ Trading Service Microservice
 Consumes market data and executes trading strategies
 """
 
+import sys
+import os
+# Add shared utils to path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'shared', 'utils'))
+
 import asyncio
 import json
 import logging
@@ -231,4 +236,5 @@ async def health_check():
     return {"status": "healthy", "timestamp": datetime.now().isoformat()}
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8002)
+    port = int(os.getenv("TRADING_SERVICE_PORT", "8002"))
+    uvicorn.run(app, host="0.0.0.0", port=port)

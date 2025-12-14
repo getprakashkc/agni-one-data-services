@@ -64,7 +64,11 @@ class DataService:
         # Redis for caching
         redis_host = os.getenv("REDIS_HOST", "localhost")
         redis_port = int(os.getenv("REDIS_PORT", "6379"))
-        self.redis_client = redis.Redis(host=redis_host, port=redis_port, db=0)
+        redis_password = os.getenv("REDIS_PASSWORD", None)
+        redis_kwargs = {"host": redis_host, "port": redis_port, "db": 0}
+        if redis_password:
+            redis_kwargs["password"] = redis_password
+        self.redis_client = redis.Redis(**redis_kwargs)
         
         # WebSocket connections
         self.market_streamer = None
@@ -740,7 +744,11 @@ async def lifespan(app: FastAPI):
     # Get access token from Redis (set by token service)
     redis_host = os.getenv("REDIS_HOST", "localhost")
     redis_port = int(os.getenv("REDIS_PORT", "6379"))
-    redis_client = redis.Redis(host=redis_host, port=redis_port, db=0)
+    redis_password = os.getenv("REDIS_PASSWORD", None)
+    redis_kwargs = {"host": redis_host, "port": redis_port, "db": 0}
+    if redis_password:
+        redis_kwargs["password"] = redis_password
+    redis_client = redis.Redis(**redis_kwargs)
     
     # Try to get token from Redis, fallback to environment variable
     access_token = None

@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Agnidata Trading App</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px;
+            text-align: center;
+        }
+        .content {
+            padding: 20px;
+        }
+        .status-card {
+            background: #f8f9fa;
+            border: 1px solid #dee2e6;
+            border-radius: 6px;
+            padding: 15px;
+            margin: 10px 0;
+        }
+        .status-indicator {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            margin-right: 8px;
+        }
+        .status-online { background-color: #28a745; }
+        .status-offline { background-color: #dc3545; }
+        .status-connecting { background-color: #ffc107; }
+        
+        .websocket-log {
+            background: #1e1e1e;
+            color: #d4d4d4;
+            padding: 15px;
+            border-radius: 6px;
+            height: 300px;
+            overflow-y: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+        }
+        .log-entry {
+            margin: 2px 0;
+            padding: 2px 0;
+        }
+        .log-timestamp {
+            color: #569cd6;
+        }
+        .log-type {
+            color: #4ec9b0;
+            font-weight: bold;
+        }
+        .log-message {
+            color: #d4d4d4;
+        }
+        
+        .controls {
+            margin: 20px 0;
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        .btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: background-color 0.2s;
+        }
+        .btn-primary {
+            background-color: #007bff;
+            color: white;
+        }
+        .btn-primary:hover {
+            background-color: #0056b3;
+        }
+        .btn-success {
+            background-color: #28a745;
+            color: white;
+        }
+        .btn-success:hover {
+            background-color: #1e7e34;
+        }
+        .btn-danger {
+            background-color: #dc3545;
+            color: white;
+        }
+        .btn-danger:hover {
+            background-color: #c82333;
+        }
+        .btn-warning {
+            background-color: #ffc107;
+            color: #212529;
+        }
+        .btn-warning:hover {
+            background-color: #e0a800;
+        }
+        
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            margin: 20px 0;
+        }
+        
+        .api-response {
+            background: #f8f9fa;
+            border: 1px solid #dee2e6;
+            border-radius: 6px;
+            padding: 15px;
+            margin: 10px 0;
+            max-height: 200px;
+            overflow-y: auto;
+        }
+        
+        .json-display {
+            background: #1e1e1e;
+            color: #d4d4d4;
+            padding: 10px;
+            border-radius: 4px;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            white-space: pre-wrap;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🚀 Agnidata Trading App</h1>
+            <p>Real-time Trading Dashboard</p>
+        </div>
+        
+        <div class="content">
+            <!-- Status Section -->
+            <div class="status-card">
+                <h3>📊 System Status</h3>
+                <div id="system-status">
+                    <div>
+                        <span class="status-indicator status-connecting" id="ws-status"></span>
+                        WebSocket: <span id="ws-status-text">Connecting...</span>
+                    </div>
+                    <div>
+                        <span class="status-indicator status-offline" id="data-service-status"></span>
+                        Data Service: <span id="data-service-text">Unknown</span>
+                    </div>
+                    <div>
+                        <span class="status-indicator status-offline" id="trading-service-status"></span>
+                        Trading Service: <span id="trading-service-text">Unknown</span>
+                    </div>
+                    <div>
+                        Connected Clients: <span id="client-count">0</span>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Controls -->
+            <div class="controls">
+                <button class="btn btn-primary" onclick="connectWebSocket()">Connect WebSocket</button>
+                <button class="btn btn-danger" onclick="disconnectWebSocket()">Disconnect</button>
+                <button class="btn btn-success" onclick="getMarketData()">Get Market Data</button>
+                <button class="btn btn-success" onclick="getTradingSignals()">Get Trading Signals</button>
+                <button class="btn btn-warning" onclick="getStatus()">Refresh Status</button>
+                <button class="btn btn-primary" onclick="sendTestMessage()">Send Test Message</button>
+            </div>
+            
+            <!-- API Responses -->
+            <div class="grid">
+                <div class="api-response">
+                    <h4>📈 Market Data</h4>
+                    <div id="market-data" class="json-display">Click "Get Market Data" to fetch data...</div>
+                </div>
+                
+                <div class="api-response">
+                    <h4>📊 Trading Signals</h4>
+                    <div id="trading-signals" class="json-display">Click "Get Trading Signals" to fetch data...</div>
+                </div>
+                
+                <div class="api-response">
+                    <h4>🔍 System Status</h4>
+                    <div id="status-data" class="json-display">Click "Refresh Status" to get status...</div>
+                </div>
+            </div>
+            
+            <!-- WebSocket Log -->
+            <div class="status-card">
+                <h3>📡 WebSocket Messages</h3>
+                <div id="websocket-log" class="websocket-log">
+                    <div class="log-entry">
+                        <span class="log-timestamp">[00:00:00]</span>
+                        <span class="log-type">[INFO]</span>
+                        <span class="log-message">WebSocket log will appear here...</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let websocket = null;
+        let reconnectAttempts = 0;
+        const maxReconnectAttempts = 5;
+        
+        function log(message, type = 'INFO') {
+            const timestamp = new Date().toLocaleTimeString();
+            const logContainer = document.getElementById('websocket-log');
+            const logEntry = document.createElement('div');
+            logEntry.className = 'log-entry';
+            logEntry.innerHTML = `
+                <span class="log-timestamp">[${timestamp}]</span>
+                <span class="log-type">[${type}]</span>
+                <span class="log-message">${message}</span>
+            `;
+            logContainer.appendChild(logEntry);
+            logContainer.scrollTop = logContainer.scrollHeight;
+        }
+        
+        function updateStatus(elementId, textId, status, text) {
+            const indicator = document.getElementById(elementId);
+            const textElement = document.getElementById(textId);
+            
+            indicator.className = `status-indicator status-${status}`;
+            textElement.textContent = text;
+        }
+        
+        function connectWebSocket() {
+            if (websocket && websocket.readyState === WebSocket.OPEN) {
+                log('WebSocket already connected', 'WARN');
+                return;
+            }
+            
+            log('Connecting to WebSocket...', 'INFO');
+            updateStatus('ws-status', 'ws-status-text', 'connecting', 'Connecting...');
+            
+            websocket = new WebSocket('ws://localhost:8003/ws');
+            
+            websocket.onopen = function(event) {
+                log('WebSocket connected successfully', 'SUCCESS');
+                updateStatus('ws-status', 'ws-status-text', 'online', 'Connected');
+                reconnectAttempts = 0;
+            };
+            
+            websocket.onmessage = function(event) {
+                log(`Received: ${event.data}`, 'MESSAGE');
+                try {
+                    const data = JSON.parse(event.data);
+                    if (data.type === 'echo') {
+                        log(`Echo response: ${data.message}`, 'ECHO');
+                    }
+                } catch (e) {
+                    log(`Raw message: ${event.data}`, 'RAW');
+                }
+            };
+            
+            websocket.onclose = function(event) {
+                log(`WebSocket closed: ${event.code} - ${event.reason}`, 'WARN');
+                updateStatus('ws-status', 'ws-status-text', 'offline', 'Disconnected');
+                
+                if (reconnectAttempts < maxReconnectAttempts) {
+                    reconnectAttempts++;
+                    log(`Attempting to reconnect... (${reconnectAttempts}/${maxReconnectAttempts})`, 'RETRY');
+                    setTimeout(connectWebSocket, 2000);
+                } else {
+                    log('Max reconnection attempts reached', 'ERROR');
+                }
+            };
+            
+            websocket.onerror = function(error) {
+                log(`WebSocket error: ${error}`, 'ERROR');
+                updateStatus('ws-status', 'ws-status-text', 'offline', 'Error');
+            };
+        }
+        
+        function disconnectWebSocket() {
+            if (websocket) {
+                websocket.close();
+                websocket = null;
+                log('WebSocket disconnected manually', 'INFO');
+            }
+        }
+        
+        function sendTestMessage() {
+            if (websocket && websocket.readyState === WebSocket.OPEN) {
+                const message = {
+                    type: 'test',
+                    message: 'Hello from client!',
+                    timestamp: new Date().toISOString()
+                };
+                websocket.send(JSON.stringify(message));
+                log(`Sent test message: ${JSON.stringify(message)}`, 'SEND');
+            } else {
+                log('WebSocket not connected', 'ERROR');
+            }
+        }
+        
+        async function getMarketData() {
+            try {
+                log('Fetching market data...', 'API');
+                const response = await fetch('/api/market-data');
+                const data = await response.json();
+                document.getElementById('market-data').textContent = JSON.stringify(data, null, 2);
+                log('Market data fetched successfully', 'SUCCESS');
+            } catch (error) {
+                log(`Error fetching market data: ${error}`, 'ERROR');
+            }
+        }
+        
+        async function getTradingSignals() {
+            try {
+                log('Fetching trading signals...', 'API');
+                const response = await fetch('/api/signals');
+                const data = await response.json();
+                document.getElementById('trading-signals').textContent = JSON.stringify(data, null, 2);
+                log('Trading signals fetched successfully', 'SUCCESS');
+            } catch (error) {
+                log(`Error fetching trading signals: ${error}`, 'ERROR');
+            }
+        }
+        
+        async function getStatus() {
+            try {
+                log('Fetching system status...', 'API');
+                const response = await fetch('/api/status');
+                const data = await response.json();
+                document.getElementById('status-data').textContent = JSON.stringify(data, null, 2);
+                
+                // Update status indicators
+                if (data.status === 'running') {
+                    updateStatus('data-service-status', 'data-service-text', 'online', 'Connected');
+                    updateStatus('trading-service-status', 'trading-service-text', 'online', 'Connected');
+                    document.getElementById('client-count').textContent = data.connected_clients || 0;
+                } else {
+                    updateStatus('data-service-status', 'data-service-text', 'offline', 'Unknown');
+                    updateStatus('trading-service-status', 'trading-service-text', 'offline', 'Unknown');
+                }
+                
+                log('System status fetched successfully', 'SUCCESS');
+            } catch (error) {
+                log(`Error fetching status: ${error}`, 'ERROR');
+            }
+        }
+        
+        // Auto-connect on page load
+        window.onload = function() {
+            log('Trading App Dashboard loaded', 'INFO');
+            connectWebSocket();
+            getStatus();
+        };
+    </script>
+</body>
+</html>
+

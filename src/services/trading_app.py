@@ -4,6 +4,11 @@ Trading Application
 Frontend application that consumes data and trading services
 """
 
+import sys
+import os
+# Add shared utils to path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'shared', 'utils'))
+
 import asyncio
 import json
 import logging
@@ -25,9 +30,9 @@ logger = logging.getLogger(__name__)
 class TradingApp:
     """Main trading application"""
     
-    def __init__(self, data_service_url: str, trading_service_url: str):
-        self.data_service_url = data_service_url
-        self.trading_service_url = trading_service_url
+    def __init__(self, data_service_url: str = None, trading_service_url: str = None):
+        self.data_service_url = data_service_url or os.getenv("DATA_SERVICE_URL", "http://localhost:8001")
+        self.trading_service_url = trading_service_url or os.getenv("TRADING_SERVICE_URL", "http://localhost:8002")
         self.websocket = None
         self.running = False
     
@@ -105,10 +110,7 @@ trading_app = None
 async def startup_event():
     """Initialize trading app on startup"""
     global trading_app
-    trading_app = TradingApp(
-        data_service_url="http://localhost:8001",
-        trading_service_url="http://localhost:8002"
-    )
+    trading_app = TradingApp()
     await trading_app.connect_to_data_service()
     logger.info("Trading app started")
 
@@ -164,4 +166,5 @@ async def health_check():
     return {"status": "healthy", "timestamp": datetime.now().isoformat()}
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.getenv("TRADING_APP_PORT", "8003"))
+    uvicorn.run(app, host="0.0.0.0", port=port)

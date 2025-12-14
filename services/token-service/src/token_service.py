@@ -32,8 +32,11 @@ class TokenUpdateRequest(BaseModel):
 class TokenService:
     """Simple token management service"""
     
-    def __init__(self, redis_host='localhost', redis_port=6379, redis_db=0):
-        self.redis_client = redis.Redis(host=redis_host, port=redis_port, db=redis_db)
+    def __init__(self, redis_host='localhost', redis_port=6379, redis_db=0, redis_password=None):
+        redis_kwargs = {"host": redis_host, "port": redis_port, "db": redis_db}
+        if redis_password:
+            redis_kwargs["password"] = redis_password
+        self.redis_client = redis.Redis(**redis_kwargs)
         self.token_url = os.getenv("INTERNAL_API_BASE_URL", "http://192.168.1.206:9000") + f"/accounts/{os.getenv('INTERNAL_API_ACCOUNT_ID', 'agnidata001')}/token"
         self.current_token = None
         self.token_expires_at = None
@@ -203,7 +206,8 @@ app = FastAPI(title="Token Management Service", version="1.0.0")
 # Initialize token service
 redis_host = os.getenv("REDIS_HOST", "localhost")
 redis_port = int(os.getenv("REDIS_PORT", "6379"))
-token_service = TokenService(redis_host=redis_host, redis_port=redis_port)
+redis_password = os.getenv("REDIS_PASSWORD", None)
+token_service = TokenService(redis_host=redis_host, redis_port=redis_port, redis_password=redis_password)
 
 @app.on_event("startup")
 async def startup_event():

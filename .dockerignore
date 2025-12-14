@@ -1,0 +1,71 @@
+# Docker ignore for all services
+# Build context is project root, so this applies to all services
+
+# Git
+.git
+.gitignore
+.github
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info
+dist
+build
+venv
+env
+.venv
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# Documentation
+docs/
+*.md
+!services/*/README.md
+
+# Tests
+test/
+tests/
+src/tests/
+*.test.py
+
+# Examples
+examples/
+src/examples/
+
+# Old structure (can be removed after migration)
+src/services/
+src/utils/
+
+# Logs
+logs/
+*.log
+
+# Environment
+.env
+.env.local
+
+# Docker
+docker-compose.yml
+Dockerfile
+.dockerignore
+
+# CI/CD
+.travis.yml
+.github/
+
+# Other
+*.txt
+!requirements.txt
+!services/*/requirements.txt
+!shared/**/*.txt

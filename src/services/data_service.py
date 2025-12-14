@@ -4,6 +4,12 @@ Data Service Microservice
 Handles WebSocket connections, market data processing, and data distribution
 """
 
+import sys
+import os
+# Add shared code to path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'shared', 'upstox_client'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'shared', 'utils'))
+
 import asyncio
 import json
 import time
@@ -56,7 +62,9 @@ class DataService:
         self.api_client = upstox_client.ApiClient(self.configuration)
         
         # Redis for caching
-        self.redis_client = redis.Redis(host='localhost', port=6379, db=0)
+        redis_host = os.getenv("REDIS_HOST", "localhost")
+        redis_port = int(os.getenv("REDIS_PORT", "6379"))
+        self.redis_client = redis.Redis(host=redis_host, port=redis_port, db=0)
         
         # WebSocket connections
         self.market_streamer = None
@@ -728,7 +736,27 @@ async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown events"""
     # Startup
     global data_service
-    access_token = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI0TUNZVzIiLCJqdGkiOiI2OTNlMjEzZjZkOTUwZjdjMDVhY2JlNDEiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaWF0IjoxNzY1Njc5NDIzLCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3NjU3NDk2MDB9.saxWqD54NIO-uH6QDcFTJC-Fr8KJlf03ez_CgQzj-Uc"
+    
+    # Get access token from Redis (set by token service)
+    redis_host = os.getenv("REDIS_HOST", "localhost")
+    redis_port = int(os.getenv("REDIS_PORT", "6379"))
+    redis_client = redis.Redis(host=redis_host, port=redis_port, db=0)
+    
+    # Try to get token from Redis, fallback to environment variable
+    access_token = None
+    try:
+        token = redis_client.get("upstox_access_token")
+        if token:
+            access_token = token.decode('utf-8')
+    except Exception as e:
+        logger.warning(f"Could not get token from Redis: {e}")
+    
+    # Fallback to environment variable
+    if not access_token:
+        access_token = os.getenv("UPSTOX_ACCESS_TOKEN")
+        if not access_token:
+            logger.error("No access token found in Redis or environment variables!")
+            raise ValueError("UPSTOX_ACCESS_TOKEN must be set or available in Redis")
     
     data_service = DataService(access_token)
     
@@ -997,4 +1025,5 @@ async def health_check():
     }
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    port = int(os.getenv("DATA_SERVICE_PORT", "8001"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
