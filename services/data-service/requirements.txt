@@ -19,4 +19,5 @@ pytz>=2023.3
 
 # Web framework
 fastapi>=0.100.0
-uvicorn>=0.20.0
+# Standard extra pulls in websockets/wsproto for WS support
+uvicorn[standard]>=0.20.0
