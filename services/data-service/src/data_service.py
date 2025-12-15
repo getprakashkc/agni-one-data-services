@@ -21,8 +21,9 @@ from datetime import datetime
 from contextlib import asynccontextmanager
 import upstox_client
 import redis
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 import uvicorn
 
 # Configure logging
@@ -51,6 +52,14 @@ class OHLCCandle:
     volume: int
     timestamp: int
     candle_status: str  # "active" or "completed"
+
+class InstrumentSubscribeRequest(BaseModel):
+    """Request model for subscribing to instruments"""
+    instruments: List[str]
+
+class InstrumentUnsubscribeRequest(BaseModel):
+    """Request model for unsubscribing from instruments"""
+    instruments: List[str]
 
 class DataService:
     """Core data service for market data management"""
@@ -85,12 +94,18 @@ class DataService:
         # Data cache
         self.market_data_cache: Dict[str, MarketData] = {}
         
+        # Track currently subscribed instruments from Upstox
+        self.subscribed_instruments: Set[str] = set()
+        
         # History API for fetching historical candles
         self.history_api = upstox_client.HistoryV3Api(self.api_client)
     
     def start_market_data_stream(self, instruments: List[str]):
         """Start market data streaming"""
         logger.info(f"Starting market data stream for {len(instruments)} instruments")
+        
+        # Track initial subscribed instruments
+        self.subscribed_instruments.update(instruments)
         
         self.market_streamer = upstox_client.MarketDataStreamerV3(
             api_client=self.api_client,
@@ -105,6 +120,80 @@ class DataService:
         self.market_streamer.on("close", self._on_market_close)
         
         self.market_streamer.connect()
+    
+    def add_instruments(self, instruments: List[str]) -> Tuple[bool, str]:
+        """Add instruments to Upstox stream dynamically
+        
+        Args:
+            instruments: List of instrument keys to subscribe to
+            
+        Returns:
+            Tuple of (success: bool, message: str)
+        """
+        if not self.market_streamer:
+            return False, "Market data streamer is not initialized"
+        
+        if not instruments:
+            return False, "No instruments provided"
+        
+        try:
+            # Filter out already subscribed instruments
+            new_instruments = [inst for inst in instruments if inst not in self.subscribed_instruments]
+            
+            if not new_instruments:
+                return True, f"All instruments already subscribed: {instruments}"
+            
+            # Subscribe to new instruments using SDK's subscribe method
+            self.market_streamer.subscribe(new_instruments, "full")
+            
+            # Update tracked subscriptions
+            self.subscribed_instruments.update(new_instruments)
+            
+            logger.info(f"Successfully subscribed to {len(new_instruments)} new instruments: {new_instruments}")
+            return True, f"Successfully subscribed to {len(new_instruments)} instruments: {new_instruments}"
+            
+        except Exception as e:
+            logger.error(f"Error subscribing to instruments {instruments}: {e}")
+            return False, f"Failed to subscribe: {str(e)}"
+    
+    def remove_instruments(self, instruments: List[str]) -> Tuple[bool, str]:
+        """Remove instruments from Upstox stream dynamically
+        
+        Args:
+            instruments: List of instrument keys to unsubscribe from
+            
+        Returns:
+            Tuple of (success: bool, message: str)
+        """
+        if not self.market_streamer:
+            return False, "Market data streamer is not initialized"
+        
+        if not instruments:
+            return False, "No instruments provided"
+        
+        try:
+            # Filter to only instruments that are actually subscribed
+            instruments_to_remove = [inst for inst in instruments if inst in self.subscribed_instruments]
+            
+            if not instruments_to_remove:
+                return True, f"None of the instruments were subscribed: {instruments}"
+            
+            # Unsubscribe using SDK's unsubscribe method
+            self.market_streamer.unsubscribe(instruments_to_remove)
+            
+            # Update tracked subscriptions
+            self.subscribed_instruments.difference_update(instruments_to_remove)
+            
+            logger.info(f"Successfully unsubscribed from {len(instruments_to_remove)} instruments: {instruments_to_remove}")
+            return True, f"Successfully unsubscribed from {len(instruments_to_remove)} instruments: {instruments_to_remove}"
+            
+        except Exception as e:
+            logger.error(f"Error unsubscribing from instruments {instruments}: {e}")
+            return False, f"Failed to unsubscribe: {str(e)}"
+    
+    def get_subscribed_instruments(self) -> List[str]:
+        """Get list of currently subscribed instruments"""
+        return sorted(list(self.subscribed_instruments))
     
     def start_portfolio_stream(self):
         """Start portfolio data streaming"""
@@ -768,15 +857,27 @@ async def lifespan(app: FastAPI):
     
     data_service = DataService(access_token)
     
-    # Start market data stream
-    instruments = [
-        "NSE_INDEX|Nifty 50",
-        "NSE_INDEX|Nifty Bank",
-        "NSE_EQ|INE020B01018",  # Reliance
-        "NSE_EQ|INE467B01029"    # TCS
-    ]
+    # Get initial instruments from environment variable or use default
+    instruments_env = os.getenv("INSTRUMENTS", "").strip()
     
-    data_service.start_market_data_stream(instruments)
+    if instruments_env:
+        # Parse comma-separated list from environment variable
+        instruments = [inst.strip() for inst in instruments_env.split(",") if inst.strip()]
+        logger.info(f"Using instruments from INSTRUMENTS environment variable: {len(instruments)} instruments")
+    else:
+        # Fallback to default hardcoded list
+        instruments = [
+            "NSE_INDEX|Nifty 50",
+            "NSE_INDEX|Nifty Bank",
+            "NSE_EQ|INE020B01018",  # Reliance
+            "NSE_EQ|INE467B01029"    # TCS
+        ]
+        logger.info(f"Using default instruments: {len(instruments)} instruments")
+    
+    if not instruments:
+        logger.warning("No instruments configured! Service will start but won't receive market data.")
+    else:
+        data_service.start_market_data_stream(instruments)
     data_service.start_portfolio_stream()
     
     logger.info("Data service started")
@@ -1022,6 +1123,73 @@ async def get_subscriptions_info():
         "clients": subscriptions_info
     }
 
+@app.get("/api/instruments")
+async def get_subscribed_instruments():
+    """Get list of currently subscribed instruments from Upstox"""
+    return {
+        "subscribed_instruments": data_service.get_subscribed_instruments(),
+        "count": len(data_service.subscribed_instruments),
+        "timestamp": datetime.now().isoformat()
+    }
+
+@app.post("/api/instruments/subscribe")
+async def subscribe_instruments(request: InstrumentSubscribeRequest):
+    """Subscribe to new instruments dynamically
+    
+    Adds instruments to the Upstox stream without disconnecting.
+    Supports bulk operations - can subscribe to multiple instruments at once.
+    
+    Example:
+        POST /api/instruments/subscribe
+        {
+            "instruments": ["NSE_INDEX|Nifty 50", "BSE_INDEX|SENSEX"]
+        }
+    """
+    if not request.instruments:
+        raise HTTPException(status_code=400, detail="instruments list cannot be empty")
+    
+    success, message = data_service.add_instruments(request.instruments)
+    
+    if success:
+        return {
+            "status": "success",
+            "message": message,
+            "subscribed_instruments": data_service.get_subscribed_instruments(),
+            "count": len(data_service.subscribed_instruments),
+            "timestamp": datetime.now().isoformat()
+        }
+    else:
+        raise HTTPException(status_code=500, detail=message)
+
+@app.post("/api/instruments/unsubscribe")
+async def unsubscribe_instruments(request: InstrumentUnsubscribeRequest):
+    """Unsubscribe from instruments dynamically
+    
+    Removes instruments from the Upstox stream without disconnecting.
+    Supports bulk operations - can unsubscribe from multiple instruments at once.
+    
+    Example:
+        POST /api/instruments/unsubscribe
+        {
+            "instruments": ["NSE_INDEX|Nifty 50"]
+        }
+    """
+    if not request.instruments:
+        raise HTTPException(status_code=400, detail="instruments list cannot be empty")
+    
+    success, message = data_service.remove_instruments(request.instruments)
+    
+    if success:
+        return {
+            "status": "success",
+            "message": message,
+            "subscribed_instruments": data_service.get_subscribed_instruments(),
+            "count": len(data_service.subscribed_instruments),
+            "timestamp": datetime.now().isoformat()
+        }
+    else:
+        raise HTTPException(status_code=500, detail=message)
+
 @app.get("/api/health")
 async def health_check():
     """Health check endpoint"""
@@ -1029,7 +1197,8 @@ async def health_check():
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
         "active_connections": len(data_service.subscribers),
-        "cached_instruments": len(data_service.market_data_cache)
+        "cached_instruments": len(data_service.market_data_cache),
+        "subscribed_instruments_count": len(data_service.subscribed_instruments)
     }
 
 if __name__ == "__main__":

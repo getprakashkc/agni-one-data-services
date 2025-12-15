@@ -66,6 +66,7 @@ REDIS_HOST=redis
 REDIS_PORT=6379
 REDIS_PASSWORD=<your-redis-password-if-set>
 DATA_SERVICE_PORT=8001
+INSTRUMENTS=NSE_INDEX|Nifty 50,NSE_INDEX|Nifty Bank,BSE_INDEX|SENSEX
 # UPSTOX_ACCESS_TOKEN will be fetched from Redis (set by token-service)
 ```
 

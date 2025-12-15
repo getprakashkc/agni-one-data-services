@@ -59,6 +59,7 @@ REDIS_PORT=6379
 REDIS_PASSWORD=<your-redis-password-if-set>
 UPSTOX_ACCESS_TOKEN=<token-from-redis-or-env>
 DATA_SERVICE_PORT=8001
+INSTRUMENTS=NSE_INDEX|Nifty 50,NSE_INDEX|Nifty Bank,BSE_INDEX|SENSEX
 ```
 
 **Health Check:**

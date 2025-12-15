@@ -1,55 +1,34 @@
-# Cleaning Up src/ Folder
+# src/ Folder Cleanup - ✅ COMPLETED
 
-## Current Status
+## Status: Removed
 
-The `src/` folder contains:
-- ✅ `src/examples/` - **Keep** (useful for development/testing)
-- ✅ `src/tests/` - **Keep** (useful for testing)
-- ❌ `src/services/` - **Can Remove** (duplicated in `services/`)
-- ❌ `src/utils/` - **Can Remove** (duplicated in `shared/utils/`)
+The `src/` folder has been **completely removed** after successful Coolify deployment.
 
-## Safe to Remove
+## What Was Removed
 
-### `src/services/`
-- **Status**: Duplicated in `services/`
-- **Action**: Can be removed after verifying new structure works
-- **Note**: New services use `services/` folder
+- ❌ `src/services/` - Duplicated in `services/` (now using microservices structure)
+- ❌ `src/utils/` - Duplicated in `shared/utils/` (now using shared code structure)
+- ❌ `src/examples/` - Old example applications (not needed for production)
+- ❌ `src/tests/` - Old test files (can be recreated if needed)
 
-### `src/utils/`
-- **Status**: Duplicated in `shared/utils/`
-- **Action**: Can be removed after verifying new structure works
-- **Note**: All services now import from `shared/utils/`
+## Current Structure
 
-## Keep for Now
+All code is now organized in the new structure:
+- `services/` - Individual microservices (token-service, data-service, etc.)
+- `shared/` - Shared code (upstox_client, utils)
+- `examples/` - Example applications (if needed, can be recreated)
 
-### `src/examples/`
-- **Status**: Example applications
-- **Action**: Keep for development/testing
-- **Usage**: Local development, testing, reference
+## Note on Old Scripts
 
-### `src/tests/`
-- **Status**: Test files
-- **Action**: Keep for testing
-- **Usage**: Running tests locally
+The following scripts still reference the old `src/` structure but are not used in Coolify:
+- `start_services.py` - Local development script (references removed `src/` paths)
+- `start_production.py` - Local production script (references removed `src/` paths)
 
-## Migration Checklist
+These scripts can be updated or removed if no longer needed for local development.
 
-- [ ] Verify all services work with new structure
-- [ ] Test deployments in Coolify
-- [ ] Update any scripts that reference `src/services/`
-- [ ] Remove `src/services/` folder
-- [ ] Remove `src/utils/` folder
-- [ ] Keep `src/examples/` and `src/tests/` for development
+## Benefits
 
-## Scripts to Update
-
-If you use these scripts, update them to use new paths:
-- `start_services.py` - References `src/services/` and `src/examples/`
-- `start_production.py` - May reference old paths
-
-## Recommendation
-
-**After successful Coolify deployment:**
-1. Remove `src/services/` (duplicated)
-2. Remove `src/utils/` (duplicated)
-3. Keep `src/examples/` and `src/tests/` for local development
+✅ **Cleaner Structure** - No duplicate code  
+✅ **Clear Separation** - Services and shared code clearly separated  
+✅ **Production Ready** - All code in proper microservices structure  
+✅ **Coolify Optimized** - Watch paths work correctly
