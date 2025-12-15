@@ -15,6 +15,7 @@ import json
 import time
 import logging
 import uuid
+import requests
 from typing import Dict, List, Callable, Set, Tuple
 from dataclasses import dataclass
 from datetime import datetime
@@ -839,21 +840,39 @@ async def lifespan(app: FastAPI):
         redis_kwargs["password"] = redis_password
     redis_client = redis.Redis(**redis_kwargs)
     
-    # Try to get token from Redis, fallback to environment variable
+    # Try to get token from Redis first (primary source)
     access_token = None
     try:
         token = redis_client.get("upstox_access_token")
         if token:
             access_token = token.decode('utf-8')
+            logger.info("✅ Token retrieved from Redis")
     except Exception as e:
         logger.warning(f"Could not get token from Redis: {e}")
     
-    # Fallback to environment variable
+    # Fallback 1: Try token-service API if Redis fails
+    if not access_token:
+        try:
+            token_service_url = os.getenv("TOKEN_SERVICE_URL", "http://token-service:8000")
+            response = requests.get(f"{token_service_url}/token/status", timeout=5)
+            if response.status_code == 200:
+                token_data = response.json()
+                if token_data.get('access_token'):
+                    access_token = token_data['access_token']
+                    logger.info("✅ Token retrieved from token-service API")
+                else:
+                    logger.warning("Token service returned status but no access_token")
+        except Exception as e:
+            logger.warning(f"Could not get token from token-service API: {e}")
+    
+    # Fallback 2: Environment variable (last resort only)
     if not access_token:
         access_token = os.getenv("UPSTOX_ACCESS_TOKEN")
-        if not access_token:
-            logger.error("No access token found in Redis or environment variables!")
-            raise ValueError("UPSTOX_ACCESS_TOKEN must be set or available in Redis")
+        if access_token:
+            logger.warning("⚠️ Using token from environment variable (fallback mode)")
+        else:
+            logger.error("No access token found in Redis, token-service API, or environment variables!")
+            raise ValueError("UPSTOX_ACCESS_TOKEN must be available from token-service (Redis/API) or environment variable")
     
     data_service = DataService(access_token)
     
