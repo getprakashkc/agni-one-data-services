@@ -70,6 +70,8 @@ class DataService:
         self.configuration = upstox_client.Configuration()
         self.configuration.access_token = access_token
         self.api_client = upstox_client.ApiClient(self.configuration)
+        # Event loop reference for thread-safe websocket sends
+        self.loop = asyncio.get_event_loop()
         
         # Redis for caching
         redis_host = os.getenv("REDIS_HOST", "localhost")
@@ -428,7 +430,7 @@ class DataService:
             
             if should_receive:
                 try:
-                    asyncio.create_task(websocket.send_text(message_str))
+                    asyncio.run_coroutine_threadsafe(websocket.send_text(message_str), self.loop)
                 except Exception as e:
                     logger.error(f"Error sending OHLC to client {client_id}: {e}")
                     disconnected_clients.append(client_id)
@@ -508,7 +510,7 @@ class DataService:
             
             if should_receive:
                 try:
-                    asyncio.create_task(websocket.send_text(message_str))
+                    asyncio.run_coroutine_threadsafe(websocket.send_text(message_str), self.loop)
                 except Exception as e:
                     logger.error(f"Error sending to client {client_id}: {e}")
                     disconnected_clients.append(client_id)
