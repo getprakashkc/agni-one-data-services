@@ -123,6 +123,62 @@ class DataService:
         
         # Track currently subscribed instruments from Upstox
         self.subscribed_instruments: Set[str] = set()
+
+    def reload_tokens(self, access_tokens: List[str]):
+        """
+        Reload Upstox access tokens in-memory and restart all Upstox streams.
+
+        This keeps existing WebSocket subscribers and OHLC subscriptions intact;
+        only the upstream connections to Upstox are restarted.
+        """
+        if not access_tokens:
+            raise ValueError("access_tokens cannot be empty when reloading tokens")
+
+        logger.info(f"🔄 Reloading Upstox tokens (count={len(access_tokens)})")
+
+        # Stop current streams (best-effort)
+        try:
+            self.stop()
+        except Exception as e:
+            logger.warning(f"Error while stopping existing streams during token reload: {e}")
+
+        # Replace tokens and API clients
+        self.access_tokens = access_tokens
+        self.api_clients = []
+        self.history_apis = []
+
+        for token in access_tokens:
+            configuration = upstox_client.Configuration()
+            configuration.access_token = token
+            api_client = upstox_client.ApiClient(configuration)
+            self.api_clients.append(api_client)
+            self.history_apis.append(upstox_client.HistoryV3Api(api_client))
+
+        # Use first API client as primary for history API
+        self.api_client = self.api_clients[0] if self.api_clients else None
+        self.history_api = self.history_apis[0] if self.history_apis else None
+
+        # Reset streamers and their status tracking
+        self.market_streamers = []
+        self.portfolio_streamers = []
+        self.market_streamer_status = []
+        self.portfolio_streamer_status = []
+
+        # Restart streams with the current subscribed instruments
+        instruments = self.get_subscribed_instruments()
+        if instruments:
+            logger.info(
+                f"Restarting market data streams with {len(instruments)} instruments after token reload"
+            )
+            self.start_market_data_stream(instruments)
+        else:
+            logger.warning(
+                "No subscribed instruments found when reloading tokens; "
+                "market data stream will be idle until instruments are added"
+            )
+
+        # Portfolio stream does not depend on instrument list
+        self.start_portfolio_stream()
     
     def start_market_data_stream(self, instruments: List[str]):
         """Start market data streaming with multiple streamers for redundancy"""
@@ -1045,20 +1101,36 @@ async def lifespan(app: FastAPI):
     
     # Collect multiple access tokens for redundancy
     access_tokens = []
-    
+
+    # Optional: load tokens for specific Upstox accounts (comma-separated)
+    # If set, we will look for per-account keys written by token-service:
+    #   upstox_access_token:{account_id}
+    account_ids_env = os.getenv("UPSTOX_ACCOUNT_IDS", "").strip()
+    account_ids = [x.strip() for x in account_ids_env.split(",") if x.strip()] if account_ids_env else []
+
     # Method 1: Get tokens from Redis (primary source)
     try:
-        # Try to get primary token
-        token = redis_client.get("upstox_access_token")
-        if token:
-            access_tokens.append(token.decode('utf-8'))
-            logger.info("✅ Primary token retrieved from Redis")
-        
-        # Try to get secondary token if available
-        token2 = redis_client.get("upstox_access_token_secondary")
-        if token2:
-            access_tokens.append(token2.decode('utf-8'))
-            logger.info("✅ Secondary token retrieved from Redis")
+        # Preferred: per-account tokens (multi-account mode)
+        if account_ids:
+            for account_id in account_ids:
+                token = redis_client.get(f"upstox_access_token:{account_id}")
+                if token:
+                    access_tokens.append(token.decode('utf-8'))
+                    logger.info(f"✅ Token retrieved from Redis for account_id={account_id}")
+                else:
+                    logger.warning(f"⚠️ No Redis token found for account_id={account_id} (expected key upstox_access_token:{account_id})")
+        else:
+            # Backward-compatible single-token keys
+            token = redis_client.get("upstox_access_token")
+            if token:
+                access_tokens.append(token.decode('utf-8'))
+                logger.info("✅ Primary token retrieved from Redis")
+
+            # Optional legacy secondary token
+            token2 = redis_client.get("upstox_access_token_secondary")
+            if token2:
+                access_tokens.append(token2.decode('utf-8'))
+                logger.info("✅ Secondary token retrieved from Redis")
     except Exception as e:
         logger.warning(f"Could not get tokens from Redis: {e}")
     
@@ -1066,14 +1138,27 @@ async def lifespan(app: FastAPI):
     if not access_tokens:
         try:
             token_service_url = os.getenv("TOKEN_SERVICE_URL", "http://token-service:8000")
-            response = requests.get(f"{token_service_url}/token/status", timeout=5)
-            if response.status_code == 200:
-                token_data = response.json()
-                if token_data.get('access_token'):
-                    access_tokens.append(token_data['access_token'])
-                    logger.info("✅ Token retrieved from token-service API")
-                else:
-                    logger.warning("Token service returned status but no access_token")
+            if account_ids:
+                for account_id in account_ids:
+                    response = requests.get(f"{token_service_url}/accounts/{account_id}/token/status", timeout=5)
+                    if response.status_code == 200:
+                        token_data = response.json()
+                        if token_data.get('access_token'):
+                            access_tokens.append(token_data['access_token'])
+                            logger.info(f"✅ Token retrieved from token-service API for account_id={account_id}")
+                        else:
+                            logger.warning(f"Token service returned status but no access_token for account_id={account_id}")
+                    else:
+                        logger.warning(f"Token service status call failed for account_id={account_id}: {response.status_code}")
+            else:
+                response = requests.get(f"{token_service_url}/token/status", timeout=5)
+                if response.status_code == 200:
+                    token_data = response.json()
+                    if token_data.get('access_token'):
+                        access_tokens.append(token_data['access_token'])
+                        logger.info("✅ Token retrieved from token-service API")
+                    else:
+                        logger.warning("Token service returned status but no access_token")
         except Exception as e:
             logger.warning(f"Could not get token from token-service API: {e}")
     
@@ -1455,6 +1540,146 @@ async def health_check():
         "cached_instruments": len(data_service.market_data_cache),
         "subscribed_instruments_count": len(data_service.subscribed_instruments),
         "streamers": streamer_status
+    }
+
+
+@app.post("/api/admin/reload-tokens")
+async def admin_reload_tokens():
+    """
+    Admin endpoint: reload Upstox access tokens from Redis / token-service
+    and restart upstream streams without restarting this service.
+    """
+    global data_service
+
+    if data_service is None:
+        raise HTTPException(status_code=503, detail="DataService is not initialized")
+
+    # Recreate Redis client (same config as in lifespan)
+    redis_host = os.getenv("REDIS_HOST", "localhost")
+    redis_port = int(os.getenv("REDIS_PORT", "6379"))
+    redis_password = os.getenv("REDIS_PASSWORD", None)
+    redis_kwargs = {"host": redis_host, "port": redis_port, "db": 0}
+    if redis_password:
+        redis_kwargs["password"] = redis_password
+    redis_client = redis.Redis(**redis_kwargs)
+
+    access_tokens: List[str] = []
+
+    # Optional list of specific Upstox account IDs whose tokens we expect in Redis
+    account_ids_env = os.getenv("UPSTOX_ACCOUNT_IDS", "").strip()
+    account_ids = [x.strip() for x in account_ids_env.split(",") if x.strip()] if account_ids_env else []
+
+    # Method 1: Get tokens from Redis (primary source)
+    try:
+        if account_ids:
+            for account_id in account_ids:
+                token = redis_client.get(f"upstox_access_token:{account_id}")
+                if token:
+                    access_tokens.append(token.decode("utf-8"))
+                    logger.info(f"✅ Reload: token retrieved from Redis for account_id={account_id}")
+                else:
+                    logger.warning(
+                        f"⚠️ Reload: no Redis token found for account_id={account_id} "
+                        f"(expected key upstox_access_token:{account_id})"
+                    )
+        else:
+            # Backward-compatible single-token keys
+            token = redis_client.get("upstox_access_token")
+            if token:
+                access_tokens.append(token.decode("utf-8"))
+                logger.info("✅ Reload: primary token retrieved from Redis")
+
+            token2 = redis_client.get("upstox_access_token_secondary")
+            if token2:
+                access_tokens.append(token2.decode("utf-8"))
+                logger.info("✅ Reload: secondary token retrieved from Redis")
+    except Exception as e:
+        logger.warning(f"Reload: could not get tokens from Redis: {e}")
+
+    # Method 2: token-service API (fallback)
+    if not access_tokens:
+        try:
+            token_service_url = os.getenv("TOKEN_SERVICE_URL", "http://token-service:8000")
+            if account_ids:
+                for account_id in account_ids:
+                    response = requests.get(
+                        f"{token_service_url}/accounts/{account_id}/token/status",
+                        timeout=5,
+                    )
+                    if response.status_code == 200:
+                        token_data = response.json()
+                        if token_data.get("access_token"):
+                            access_tokens.append(token_data["access_token"])
+                            logger.info(
+                                f"✅ Reload: token retrieved from token-service API for account_id={account_id}"
+                            )
+                        else:
+                            logger.warning(
+                                f"Reload: token-service returned status but no access_token "
+                                f"for account_id={account_id}"
+                            )
+                    else:
+                        logger.warning(
+                            f"Reload: token-service status call failed for account_id={account_id}: "
+                            f"{response.status_code}"
+                        )
+            else:
+                response = requests.get(f"{token_service_url}/token/status", timeout=5)
+                if response.status_code == 200:
+                    token_data = response.json()
+                    if token_data.get("access_token"):
+                        access_tokens.append(token_data["access_token"])
+                        logger.info("✅ Reload: token retrieved from token-service API")
+                    else:
+                        logger.warning("Reload: token-service returned status but no access_token")
+        except Exception as e:
+            logger.warning(f"Reload: could not get token from token-service API: {e}")
+
+    # Method 3: Environment variables (fallback)
+    env_token = os.getenv("UPSTOX_ACCESS_TOKEN")
+    if env_token:
+        if "," in env_token:
+            tokens = [t.strip() for t in env_token.split(",") if t.strip()]
+            access_tokens.extend(tokens)
+            logger.info(
+                f"⚠️ Reload: using {len(tokens)} tokens from UPSTOX_ACCESS_TOKEN environment variable (fallback mode)"
+            )
+        else:
+            if not access_tokens:
+                access_tokens.append(env_token)
+                logger.warning(
+                    "⚠️ Reload: using token from UPSTOX_ACCESS_TOKEN environment variable (fallback mode)"
+                )
+
+    env_token_secondary = os.getenv("UPSTOX_ACCESS_TOKEN_SECONDARY")
+    if env_token_secondary and env_token_secondary not in access_tokens:
+        access_tokens.append(env_token_secondary)
+        logger.info("⚠️ Reload: using secondary token from UPSTOX_ACCESS_TOKEN_SECONDARY environment variable")
+
+    if not access_tokens:
+        raise HTTPException(
+            status_code=500,
+            detail="No access tokens found in Redis, token-service API, or environment variables during reload",
+        )
+
+    # Deduplicate tokens while preserving order
+    seen = set()
+    deduped_tokens: List[str] = []
+    for token in access_tokens:
+        if token not in seen:
+            seen.add(token)
+            deduped_tokens.append(token)
+
+    try:
+        data_service.reload_tokens(deduped_tokens)
+    except Exception as e:
+        logger.error(f"Error while reloading tokens in DataService: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to reload tokens: {e}")
+
+    return {
+        "status": "success",
+        "token_count": len(deduped_tokens),
+        "timestamp": datetime.now().isoformat(),
     }
 
 if __name__ == "__main__":

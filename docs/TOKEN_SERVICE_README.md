@@ -25,17 +25,35 @@ GET /token/status
 ```
 Returns current token information and status.
 
+### 2b. Token Status (per account)
+```
+GET /accounts/{account_id}/token/status
+```
+Returns token information for a specific `account_id`.
+
 ### 3. Token Validation
 ```
 GET /token/validate
 ```
 Validates current token with Upstox API.
 
+### 3b. Token Validation (per account)
+```
+GET /accounts/{account_id}/token/validate
+```
+Validates the token for a specific `account_id` with Upstox API.
+
 ### 4. Manual Token Update
 ```
 POST /token/update
 ```
 Update token manually with new token.
+
+### 4b. Manual Token Update (per account)
+```
+POST /accounts/{account_id}/token/update
+```
+Update token manually for a specific `account_id`.
 
 **Request Body:**
 ```json
@@ -49,9 +67,16 @@ Update token manually with new token.
 ## 🔧 Configuration
 
 ### Internal API
-- **URL**: `http://192.168.1.206:9000/accounts/agnidata001/token`
-- **Method**: GET
-- **Response**: JSON with access_token, expires_at, etc.
+- **Base URL Env**: `TOKEN_REFRESH_SERVICE_URL`
+- **Example**: `TOKEN_REFRESH_SERVICE_URL=http://agni-upstox-auth-server:8000`
+- **Token Fetch Endpoint**: `GET {TOKEN_REFRESH_SERVICE_URL}/accounts/{account_id}/token`
+- **Token Refresh Endpoint**: `POST {TOKEN_REFRESH_SERVICE_URL}/accounts/{account_id}/refresh`
+- **Response**: JSON with `access_token`, `expires_at`, etc.
+
+### Multiple Accounts
+- **Env**: `UPSTOX_ACCOUNT_IDS`
+- **Example**: `UPSTOX_ACCOUNT_IDS=agnidata001,agnidata002`
+- Token-service will fetch and store tokens for **each account** on startup.
 
 ### Redis Configuration
 - **Host**: localhost
@@ -107,6 +132,12 @@ curl -X POST "http://localhost:8000/token/update" \
 
 - `upstox_access_token` - Current access token
 - `token_info` - Full token information with metadata
+
+### Per-account Redis Keys (multi-account)
+- `upstox_access_token:{account_id}` - Access token for that account
+- `token_info:{account_id}` - Token info/metadata for that account
+
+**Backward compatibility:** for the default account (`INTERNAL_API_ACCOUNT_ID`), token-service also continues to write `upstox_access_token` and `token_info`.
 
 ## 🎯 Integration with Trading Services
 

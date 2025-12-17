@@ -75,7 +75,7 @@ class ProductionServiceManager:
         return False
     
     def start_service(self, name, script_path, port, host='0.0.0.0'):
-               """Start a service in a subprocess"""
+        """Start a service in a subprocess"""
         try:
             logger.info(f"🚀 Starting {name} on {host}:{port}")
             
@@ -119,10 +119,10 @@ class ProductionServiceManager:
         
         # Start services in order
         services = [
-            ("Token Service", "src/services/token_service.py", self.token_port, self.token_host),
-            ("Data Service", "src/services/data_service.py", self.data_port, self.data_host),
-            ("Trading Service", "src/services/trading_service.py", self.trading_port, self.trading_host),
-            ("Trading App", "src/services/trading_app.py", self.app_port, self.app_host),
+            ("Token Service", "services/token-service/src/token_service.py", self.token_port, self.token_host),
+            ("Data Service", "services/data-service/src/data_service.py", self.data_port, self.data_host),
+            ("Trading Service", "services/trading-service/src/trading_service.py", self.trading_port, self.trading_host),
+            ("Trading App", "services/trading-app/src/trading_app.py", self.app_port, self.app_host),
         ]
         
         for name, script, port, host in services:

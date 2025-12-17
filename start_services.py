@@ -35,19 +35,25 @@ def main():
     services = [
         {
             "name": "Token Service",
-            "script": "src/services/token_service.py",
+            "script": "services/token-service/src/token_service.py",
             "required": True,
             "wait": 3
         },
         {
-            "name": "Options Trading App",
-            "script": "src/examples/options_trading_app.py",
+            "script": "services/data-service/src/data_service.py",
+            "name": "Data Service",
             "required": False,
             "wait": 2
         },
         {
-            "name": "Redis Monitor",
-            "script": "src/examples/redis_monitor.py",
+            "name": "Trading Service",
+            "script": "services/trading-service/src/trading_service.py",
+            "required": False,
+            "wait": 2
+        },
+        {
+            "name": "Trading App",
+            "script": "services/trading-app/src/trading_app.py",
             "required": False,
             "wait": 1
         }

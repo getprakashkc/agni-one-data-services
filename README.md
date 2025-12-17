@@ -65,7 +65,7 @@ pip install -r test_requirements.txt
 
 ### 2. Start Token Service
 ```bash
-python src/services/token_service.py
+python services/token-service/src/token_service.py
 ```
 Service runs on `http://localhost:8000`
 

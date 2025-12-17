@@ -9,7 +9,7 @@
 
 ### 2. Start Token Service (Required First)
 ```bash
-python src/services/token_service.py
+python services/token-service/src/token_service.py
 ```
 **Wait for:** `✅ Token service started successfully`
 
@@ -42,7 +42,7 @@ python src/examples/redis_monitor.py
 
 ### Terminal 1: Token Service
 ```bash
-python src/services/token_service.py
+python services/token-service/src/token_service.py
 ```
 
 ### Terminal 2: Trading App
