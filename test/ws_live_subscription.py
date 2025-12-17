@@ -14,9 +14,6 @@ from websocket import create_connection
 
 WS_URL = "wss://agin-one-data.hi.agni.cash/ws"
 INSTRUMENTS = [
-    "NSE_FO|48261",
-    "NSE_FO|48262",
-    "NSE_FO|48265",
     "NSE_INDEX|Nifty 50",
     "NSE_INDEX|Nifty Bank",
 ]

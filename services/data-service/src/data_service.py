@@ -16,7 +16,7 @@ import time
 import logging
 import uuid
 import requests
-from typing import Dict, List, Callable, Set, Tuple
+from typing import Dict, List, Callable, Set, Tuple, Any
 from dataclasses import dataclass
 from datetime import datetime
 from contextlib import asynccontextmanager
@@ -63,14 +63,19 @@ class InstrumentUnsubscribeRequest(BaseModel):
     instruments: List[str]
 
 class DataService:
-    """Core data service for market data management"""
+    """Core data service for market data management with support for multiple Upstox accounts for redundancy"""
     
-    def __init__(self, access_token: str):
-        self.access_token = access_token
-        self.configuration = upstox_client.Configuration()
-        self.configuration.access_token = access_token
-        self.api_client = upstox_client.ApiClient(self.configuration)
-        # Event loop reference for thread-safe websocket sends
+    def __init__(self, access_tokens: List[str]):
+        """
+        Initialize DataService with multiple access tokens for redundancy
+        
+        Args:
+            access_tokens: List of Upstox access tokens (at least one required)
+        """
+        if not access_tokens:
+            raise ValueError("At least one access token is required")
+        
+        self.access_tokens = access_tokens
         self.loop = asyncio.get_event_loop()
         
         # Redis for caching
@@ -82,9 +87,28 @@ class DataService:
             redis_kwargs["password"] = redis_password
         self.redis_client = redis.Redis(**redis_kwargs)
         
-        # WebSocket connections
-        self.market_streamer = None
-        self.portfolio_streamer = None
+        # Create API clients for each token
+        self.api_clients: List[upstox_client.ApiClient] = []
+        self.history_apis: List[upstox_client.HistoryV3Api] = []
+        
+        for token in access_tokens:
+            configuration = upstox_client.Configuration()
+            configuration.access_token = token
+            api_client = upstox_client.ApiClient(configuration)
+            self.api_clients.append(api_client)
+            self.history_apis.append(upstox_client.HistoryV3Api(api_client))
+        
+        # Use first API client as primary for operations that need a single client
+        self.api_client = self.api_clients[0] if self.api_clients else None
+        self.history_api = self.history_apis[0] if self.history_apis else None
+        
+        # WebSocket connections - list of streamers for redundancy
+        self.market_streamers: List[upstox_client.MarketDataStreamerV3] = []
+        self.portfolio_streamers: List[upstox_client.PortfolioDataStreamer] = []
+        
+        # Track connection status for each streamer
+        self.market_streamer_status: List[Dict[str, Any]] = []  # [{"connected": bool, "last_error": str, "token_index": int}]
+        self.portfolio_streamer_status: List[Dict[str, Any]] = []
         
         # Subscribers: client_id -> (websocket, subscriptions_set)
         # subscriptions_set can contain "*" for all instruments, or specific instrument_keys
@@ -99,33 +123,77 @@ class DataService:
         
         # Track currently subscribed instruments from Upstox
         self.subscribed_instruments: Set[str] = set()
-        
-        # History API for fetching historical candles
-        self.history_api = upstox_client.HistoryV3Api(self.api_client)
     
     def start_market_data_stream(self, instruments: List[str]):
-        """Start market data streaming"""
-        logger.info(f"Starting market data stream for {len(instruments)} instruments")
+        """Start market data streaming with multiple streamers for redundancy"""
+        logger.info(f"Starting market data stream for {len(instruments)} instruments with {len(self.api_clients)} streamers")
         
         # Track initial subscribed instruments
         self.subscribed_instruments.update(instruments)
         
-        self.market_streamer = upstox_client.MarketDataStreamerV3(
-            api_client=self.api_client,
-            instrumentKeys=instruments,
-            mode="full"
-        )
-        
-        # Event handlers
-        self.market_streamer.on("open", self._on_market_open)
-        self.market_streamer.on("message", self._on_market_message)
-        self.market_streamer.on("error", self._on_market_error)
-        self.market_streamer.on("close", self._on_market_close)
-        
-        self.market_streamer.connect()
+        # Initialize streamer for each access token
+        for idx, api_client in enumerate(self.api_clients):
+            try:
+                streamer = upstox_client.MarketDataStreamerV3(
+                    api_client=api_client,
+                    instrumentKeys=instruments,
+                    mode="full"
+                )
+                
+                # Create unique handlers for each streamer to track which one sent the data
+                def make_open_handler(token_idx):
+                    def handler():
+                        self._on_market_open(token_idx)
+                    return handler
+                
+                def make_message_handler(token_idx):
+                    def handler(message):
+                        self._on_market_message(message, token_idx)
+                    return handler
+                
+                def make_error_handler(token_idx):
+                    def handler(error):
+                        self._on_market_error(error, token_idx)
+                    return handler
+                
+                def make_close_handler(token_idx):
+                    def handler(close_status_code, close_msg):
+                        self._on_market_close(close_status_code, close_msg, token_idx)
+                    return handler
+                
+                # Set event handlers
+                streamer.on("open", make_open_handler(idx))
+                streamer.on("message", make_message_handler(idx))
+                streamer.on("error", make_error_handler(idx))
+                streamer.on("close", make_close_handler(idx))
+                
+                # Initialize status tracking
+                self.market_streamer_status.append({
+                    "connected": False,
+                    "last_error": None,
+                    "token_index": idx,
+                    "last_connected_at": None
+                })
+                
+                # Connect streamer
+                streamer.connect()
+                self.market_streamers.append(streamer)
+                
+                logger.info(f"Initialized market data streamer {idx + 1}/{len(self.api_clients)}")
+                
+            except Exception as e:
+                logger.error(f"Failed to initialize market data streamer {idx + 1}: {e}")
+                # Still add status tracking even if connection fails
+                self.market_streamer_status.append({
+                    "connected": False,
+                    "last_error": str(e),
+                    "token_index": idx,
+                    "last_connected_at": None
+                })
+                self.market_streamers.append(None)
     
     def add_instruments(self, instruments: List[str]) -> Tuple[bool, str]:
-        """Add instruments to Upstox stream dynamically
+        """Add instruments to Upstox stream dynamically across all active streamers
         
         Args:
             instruments: List of instrument keys to subscribe to
@@ -133,8 +201,9 @@ class DataService:
         Returns:
             Tuple of (success: bool, message: str)
         """
-        if not self.market_streamer:
-            return False, "Market data streamer is not initialized"
+        active_streamers = [s for s in self.market_streamers if s is not None]
+        if not active_streamers:
+            return False, "No active market data streamers available"
         
         if not instruments:
             return False, "No instruments provided"
@@ -146,21 +215,37 @@ class DataService:
             if not new_instruments:
                 return True, f"All instruments already subscribed: {instruments}"
             
-            # Subscribe to new instruments using SDK's subscribe method
-            self.market_streamer.subscribe(new_instruments, "full")
+            # Subscribe to new instruments on all active streamers
+            success_count = 0
+            errors = []
             
-            # Update tracked subscriptions
-            self.subscribed_instruments.update(new_instruments)
+            for idx, streamer in enumerate(active_streamers):
+                try:
+                    streamer.subscribe(new_instruments, "full")
+                    success_count += 1
+                except Exception as e:
+                    error_msg = f"Streamer {idx + 1}: {str(e)}"
+                    errors.append(error_msg)
+                    logger.warning(f"Failed to subscribe on streamer {idx + 1}: {e}")
             
-            logger.info(f"Successfully subscribed to {len(new_instruments)} new instruments: {new_instruments}")
-            return True, f"Successfully subscribed to {len(new_instruments)} instruments: {new_instruments}"
+            # Update tracked subscriptions if at least one streamer succeeded
+            if success_count > 0:
+                self.subscribed_instruments.update(new_instruments)
+                logger.info(f"Successfully subscribed to {len(new_instruments)} new instruments on {success_count}/{len(active_streamers)} streamers: {new_instruments}")
+                
+                message = f"Successfully subscribed to {len(new_instruments)} instruments on {success_count}/{len(active_streamers)} streamers"
+                if errors:
+                    message += f". Errors: {', '.join(errors)}"
+                return True, message
+            else:
+                return False, f"Failed to subscribe on all streamers: {', '.join(errors)}"
             
         except Exception as e:
             logger.error(f"Error subscribing to instruments {instruments}: {e}")
             return False, f"Failed to subscribe: {str(e)}"
     
     def remove_instruments(self, instruments: List[str]) -> Tuple[bool, str]:
-        """Remove instruments from Upstox stream dynamically
+        """Remove instruments from Upstox stream dynamically across all active streamers
         
         Args:
             instruments: List of instrument keys to unsubscribe from
@@ -168,8 +253,9 @@ class DataService:
         Returns:
             Tuple of (success: bool, message: str)
         """
-        if not self.market_streamer:
-            return False, "Market data streamer is not initialized"
+        active_streamers = [s for s in self.market_streamers if s is not None]
+        if not active_streamers:
+            return False, "No active market data streamers available"
         
         if not instruments:
             return False, "No instruments provided"
@@ -181,14 +267,30 @@ class DataService:
             if not instruments_to_remove:
                 return True, f"None of the instruments were subscribed: {instruments}"
             
-            # Unsubscribe using SDK's unsubscribe method
-            self.market_streamer.unsubscribe(instruments_to_remove)
+            # Unsubscribe from all active streamers
+            success_count = 0
+            errors = []
             
-            # Update tracked subscriptions
-            self.subscribed_instruments.difference_update(instruments_to_remove)
+            for idx, streamer in enumerate(active_streamers):
+                try:
+                    streamer.unsubscribe(instruments_to_remove)
+                    success_count += 1
+                except Exception as e:
+                    error_msg = f"Streamer {idx + 1}: {str(e)}"
+                    errors.append(error_msg)
+                    logger.warning(f"Failed to unsubscribe on streamer {idx + 1}: {e}")
             
-            logger.info(f"Successfully unsubscribed from {len(instruments_to_remove)} instruments: {instruments_to_remove}")
-            return True, f"Successfully unsubscribed from {len(instruments_to_remove)} instruments: {instruments_to_remove}"
+            # Update tracked subscriptions if at least one streamer succeeded
+            if success_count > 0:
+                self.subscribed_instruments.difference_update(instruments_to_remove)
+                logger.info(f"Successfully unsubscribed from {len(instruments_to_remove)} instruments on {success_count}/{len(active_streamers)} streamers: {instruments_to_remove}")
+                
+                message = f"Successfully unsubscribed from {len(instruments_to_remove)} instruments on {success_count}/{len(active_streamers)} streamers"
+                if errors:
+                    message += f". Errors: {', '.join(errors)}"
+                return True, message
+            else:
+                return False, f"Failed to unsubscribe on all streamers: {', '.join(errors)}"
             
         except Exception as e:
             logger.error(f"Error unsubscribing from instruments {instruments}: {e}")
@@ -199,31 +301,82 @@ class DataService:
         return sorted(list(self.subscribed_instruments))
     
     def start_portfolio_stream(self):
-        """Start portfolio data streaming"""
-        logger.info("Starting portfolio data stream")
+        """Start portfolio data streaming with multiple streamers for redundancy"""
+        logger.info(f"Starting portfolio data stream with {len(self.api_clients)} streamers")
         
-        self.portfolio_streamer = upstox_client.PortfolioDataStreamer(
-            api_client=self.api_client,
-            order_update=True,
-            position_update=True,
-            holding_update=True,
-            gtt_update=True
-        )
-        
-        # Event handlers
-        self.portfolio_streamer.on("open", self._on_portfolio_open)
-        self.portfolio_streamer.on("message", self._on_portfolio_message)
-        self.portfolio_streamer.on("error", self._on_portfolio_error)
-        self.portfolio_streamer.on("close", self._on_portfolio_close)
-        
-        self.portfolio_streamer.connect()
+        # Initialize streamer for each access token
+        for idx, api_client in enumerate(self.api_clients):
+            try:
+                streamer = upstox_client.PortfolioDataStreamer(
+                    api_client=api_client,
+                    order_update=True,
+                    position_update=True,
+                    holding_update=True,
+                    gtt_update=True
+                )
+                
+                # Create unique handlers for each streamer
+                def make_portfolio_open_handler(token_idx):
+                    def handler():
+                        self._on_portfolio_open(token_idx)
+                    return handler
+                
+                def make_portfolio_message_handler(token_idx):
+                    def handler(message):
+                        self._on_portfolio_message(message, token_idx)
+                    return handler
+                
+                def make_portfolio_error_handler(token_idx):
+                    def handler(error):
+                        self._on_portfolio_error(error, token_idx)
+                    return handler
+                
+                def make_portfolio_close_handler(token_idx):
+                    def handler(close_status_code, close_msg):
+                        self._on_portfolio_close(close_status_code, close_msg, token_idx)
+                    return handler
+                
+                # Set event handlers
+                streamer.on("open", make_portfolio_open_handler(idx))
+                streamer.on("message", make_portfolio_message_handler(idx))
+                streamer.on("error", make_portfolio_error_handler(idx))
+                streamer.on("close", make_portfolio_close_handler(idx))
+                
+                # Initialize status tracking
+                self.portfolio_streamer_status.append({
+                    "connected": False,
+                    "last_error": None,
+                    "token_index": idx,
+                    "last_connected_at": None
+                })
+                
+                # Connect streamer
+                streamer.connect()
+                self.portfolio_streamers.append(streamer)
+                
+                logger.info(f"Initialized portfolio data streamer {idx + 1}/{len(self.api_clients)}")
+                
+            except Exception as e:
+                logger.error(f"Failed to initialize portfolio data streamer {idx + 1}: {e}")
+                # Still add status tracking even if connection fails
+                self.portfolio_streamer_status.append({
+                    "connected": False,
+                    "last_error": str(e),
+                    "token_index": idx,
+                    "last_connected_at": None
+                })
+                self.portfolio_streamers.append(None)
     
-    def _on_market_open(self):
+    def _on_market_open(self, streamer_index: int = 0):
         """Handle market data connection open"""
-        logger.info("Market data WebSocket connected")
+        logger.info(f"Market data WebSocket connected (streamer {streamer_index + 1}/{len(self.market_streamers)})")
+        if streamer_index < len(self.market_streamer_status):
+            self.market_streamer_status[streamer_index]["connected"] = True
+            self.market_streamer_status[streamer_index]["last_error"] = None
+            self.market_streamer_status[streamer_index]["last_connected_at"] = datetime.now().isoformat()
     
-    def _on_market_message(self, message):
-        """Process market data messages"""
+    def _on_market_message(self, message, streamer_index: int = 0):
+        """Process market data messages from any streamer"""
         try:
             if 'feeds' in message:
                 for instrument_key, feed_data in message['feeds'].items():
@@ -439,10 +592,10 @@ class DataService:
         for client_id in disconnected_clients:
             self._remove_ohlc_subscriber(client_id)
     
-    def _on_portfolio_message(self, message):
-        """Process portfolio data messages"""
+    def _on_portfolio_message(self, message, streamer_index: int = 0):
+        """Process portfolio data messages from any streamer"""
         try:
-            # Cache portfolio data
+            # Cache portfolio data (last write wins - both streamers can update)
             self.redis_client.setex(
                 "portfolio_data",
                 300,  # 5 minutes TTL
@@ -456,31 +609,43 @@ class DataService:
             })
             
         except Exception as e:
-            logger.error(f"Error processing portfolio data: {e}")
+            logger.error(f"Error processing portfolio data (streamer {streamer_index + 1}): {e}")
     
-    def _on_market_error(self, error):
+    def _on_market_error(self, error, streamer_index: int = 0):
         """Handle market data errors"""
-        logger.error(f"Market data error: {error}")
+        logger.error(f"Market data error (streamer {streamer_index + 1}): {error}")
+        if streamer_index < len(self.market_streamer_status):
+            self.market_streamer_status[streamer_index]["last_error"] = str(error)
+            self.market_streamer_status[streamer_index]["connected"] = False
     
-    def _on_portfolio_error(self, error):
+    def _on_portfolio_error(self, error, streamer_index: int = 0):
         """Handle portfolio data errors"""
-        logger.error(f"Portfolio data error: {error}")
+        logger.error(f"Portfolio data error (streamer {streamer_index + 1}): {error}")
+        if streamer_index < len(self.portfolio_streamer_status):
+            self.portfolio_streamer_status[streamer_index]["last_error"] = str(error)
+            self.portfolio_streamer_status[streamer_index]["connected"] = False
     
-    def _on_market_close(self, close_status_code, close_msg):
+    def _on_market_close(self, close_status_code, close_msg, streamer_index: int = 0):
         """Handle market data connection close"""
-        logger.info(f"Market data connection closed: {close_status_code} - {close_msg}")
+        logger.info(f"Market data connection closed (streamer {streamer_index + 1}): {close_status_code} - {close_msg}")
+        if streamer_index < len(self.market_streamer_status):
+            self.market_streamer_status[streamer_index]["connected"] = False
+            self.market_streamer_status[streamer_index]["last_error"] = f"Connection closed: {close_msg}"
     
-    def _on_portfolio_close(self, close_status_code, close_msg):
+    def _on_portfolio_close(self, close_status_code, close_msg, streamer_index: int = 0):
         """Handle portfolio connection close"""
-        logger.info(f"Portfolio connection closed: {close_status_code} - {close_msg}")
+        logger.info(f"Portfolio connection closed (streamer {streamer_index + 1}): {close_status_code} - {close_msg}")
+        if streamer_index < len(self.portfolio_streamer_status):
+            self.portfolio_streamer_status[streamer_index]["connected"] = False
+            self.portfolio_streamer_status[streamer_index]["last_error"] = f"Connection closed: {close_msg}"
     
-    def _on_market_open(self):
-        """Handle market data connection open"""
-        logger.info("Market data WebSocket connected")
-    
-    def _on_portfolio_open(self):
+    def _on_portfolio_open(self, streamer_index: int = 0):
         """Handle portfolio connection open"""
-        logger.info("Portfolio WebSocket connected")
+        logger.info(f"Portfolio WebSocket connected (streamer {streamer_index + 1}/{len(self.portfolio_streamers)})")
+        if streamer_index < len(self.portfolio_streamer_status):
+            self.portfolio_streamer_status[streamer_index]["connected"] = True
+            self.portfolio_streamer_status[streamer_index]["last_error"] = None
+            self.portfolio_streamer_status[streamer_index]["last_connected_at"] = datetime.now().isoformat()
     
     def _broadcast_to_subscribers(self, message):
         """Broadcast message to subscribed WebSocket clients only"""
@@ -818,11 +983,47 @@ class DataService:
         return self.market_data_cache
     
     def stop(self):
-        """Stop all streams"""
-        if self.market_streamer:
-            self.market_streamer.disconnect()
-        if self.portfolio_streamer:
-            self.portfolio_streamer.disconnect()
+        """Stop all streams across all streamers"""
+        logger.info("Stopping all market data streamers...")
+        for idx, streamer in enumerate(self.market_streamers):
+            if streamer:
+                try:
+                    streamer.disconnect()
+                    logger.info(f"Disconnected market data streamer {idx + 1}")
+                except Exception as e:
+                    logger.error(f"Error disconnecting market data streamer {idx + 1}: {e}")
+        
+        logger.info("Stopping all portfolio data streamers...")
+        for idx, streamer in enumerate(self.portfolio_streamers):
+            if streamer:
+                try:
+                    streamer.disconnect()
+                    logger.info(f"Disconnected portfolio data streamer {idx + 1}")
+                except Exception as e:
+                    logger.error(f"Error disconnecting portfolio data streamer {idx + 1}: {e}")
+    
+    def get_streamer_status(self) -> Dict:
+        """Get status of all streamers"""
+        active_market = sum(1 for s in self.market_streamers if s is not None)
+        connected_market = sum(1 for status in self.market_streamer_status if status.get("connected", False))
+        
+        active_portfolio = sum(1 for s in self.portfolio_streamers if s is not None)
+        connected_portfolio = sum(1 for status in self.portfolio_streamer_status if status.get("connected", False))
+        
+        return {
+            "market_streamers": {
+                "total": len(self.market_streamers),
+                "active": active_market,
+                "connected": connected_market,
+                "status": self.market_streamer_status
+            },
+            "portfolio_streamers": {
+                "total": len(self.portfolio_streamers),
+                "active": active_portfolio,
+                "connected": connected_portfolio,
+                "status": self.portfolio_streamer_status
+            }
+        }
 
 # Global data service instance
 data_service = None
@@ -842,41 +1043,66 @@ async def lifespan(app: FastAPI):
         redis_kwargs["password"] = redis_password
     redis_client = redis.Redis(**redis_kwargs)
     
-    # Try to get token from Redis first (primary source)
-    access_token = None
+    # Collect multiple access tokens for redundancy
+    access_tokens = []
+    
+    # Method 1: Get tokens from Redis (primary source)
     try:
+        # Try to get primary token
         token = redis_client.get("upstox_access_token")
         if token:
-            access_token = token.decode('utf-8')
-            logger.info("✅ Token retrieved from Redis")
+            access_tokens.append(token.decode('utf-8'))
+            logger.info("✅ Primary token retrieved from Redis")
+        
+        # Try to get secondary token if available
+        token2 = redis_client.get("upstox_access_token_secondary")
+        if token2:
+            access_tokens.append(token2.decode('utf-8'))
+            logger.info("✅ Secondary token retrieved from Redis")
     except Exception as e:
-        logger.warning(f"Could not get token from Redis: {e}")
+        logger.warning(f"Could not get tokens from Redis: {e}")
     
-    # Fallback 1: Try token-service API if Redis fails
-    if not access_token:
+    # Method 2: Try token-service API if Redis fails
+    if not access_tokens:
         try:
             token_service_url = os.getenv("TOKEN_SERVICE_URL", "http://token-service:8000")
             response = requests.get(f"{token_service_url}/token/status", timeout=5)
             if response.status_code == 200:
                 token_data = response.json()
                 if token_data.get('access_token'):
-                    access_token = token_data['access_token']
+                    access_tokens.append(token_data['access_token'])
                     logger.info("✅ Token retrieved from token-service API")
                 else:
                     logger.warning("Token service returned status but no access_token")
         except Exception as e:
             logger.warning(f"Could not get token from token-service API: {e}")
     
-    # Fallback 2: Environment variable (last resort only)
-    if not access_token:
-        access_token = os.getenv("UPSTOX_ACCESS_TOKEN")
-        if access_token:
-            logger.warning("⚠️ Using token from environment variable (fallback mode)")
+    # Method 3: Environment variables (fallback)
+    # Support both single token and multiple tokens (comma-separated)
+    env_token = os.getenv("UPSTOX_ACCESS_TOKEN")
+    if env_token:
+        # Check if it's comma-separated (multiple tokens)
+        if ',' in env_token:
+            tokens = [t.strip() for t in env_token.split(',') if t.strip()]
+            access_tokens.extend(tokens)
+            logger.info(f"⚠️ Using {len(tokens)} tokens from UPSTOX_ACCESS_TOKEN environment variable (fallback mode)")
         else:
-            logger.error("No access token found in Redis, token-service API, or environment variables!")
-            raise ValueError("UPSTOX_ACCESS_TOKEN must be available from token-service (Redis/API) or environment variable")
+            if not access_tokens:
+                access_tokens.append(env_token)
+                logger.warning("⚠️ Using token from UPSTOX_ACCESS_TOKEN environment variable (fallback mode)")
     
-    data_service = DataService(access_token)
+    # Also check for secondary token in environment
+    env_token_secondary = os.getenv("UPSTOX_ACCESS_TOKEN_SECONDARY")
+    if env_token_secondary and env_token_secondary not in access_tokens:
+        access_tokens.append(env_token_secondary)
+        logger.info("⚠️ Using secondary token from UPSTOX_ACCESS_TOKEN_SECONDARY environment variable")
+    
+    if not access_tokens:
+        logger.error("No access tokens found in Redis, token-service API, or environment variables!")
+        raise ValueError("At least one UPSTOX_ACCESS_TOKEN must be available from token-service (Redis/API) or environment variable")
+    
+    logger.info(f"Initializing DataService with {len(access_tokens)} access token(s) for redundancy")
+    data_service = DataService(access_tokens)
     
     # Get initial instruments from environment variable or use default
     instruments_env = os.getenv("INSTRUMENTS", "").strip()
@@ -1213,13 +1439,22 @@ async def unsubscribe_instruments(request: InstrumentUnsubscribeRequest):
 
 @app.get("/api/health")
 async def health_check():
-    """Health check endpoint"""
+    """Health check endpoint with streamer status"""
+    streamer_status = data_service.get_streamer_status()
+    
+    # Determine overall health
+    market_connected = streamer_status["market_streamers"]["connected"] > 0
+    portfolio_connected = streamer_status["portfolio_streamers"]["connected"] > 0
+    
+    overall_status = "healthy" if (market_connected or portfolio_connected) else "degraded"
+    
     return {
-        "status": "healthy",
+        "status": overall_status,
         "timestamp": datetime.now().isoformat(),
         "active_connections": len(data_service.subscribers),
         "cached_instruments": len(data_service.market_data_cache),
-        "subscribed_instruments_count": len(data_service.subscribed_instruments)
+        "subscribed_instruments_count": len(data_service.subscribed_instruments),
+        "streamers": streamer_status
     }
 
 if __name__ == "__main__":
