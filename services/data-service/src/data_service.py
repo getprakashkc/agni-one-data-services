@@ -40,6 +40,16 @@ class MarketData:
     change_percent: float
     ohlc: dict
     timestamp: datetime
+    # Additional fields from full mode
+    ltq: str = None  # Last traded quantity
+    market_level: dict = None  # Bid/ask quotes (marketLevel)
+    option_greeks: dict = None  # Option Greeks (delta, theta, gamma, vega, rho)
+    atp: float = None  # Average traded price
+    vtt: str = None  # Volume traded today
+    oi: float = None  # Open interest
+    iv: float = None  # Implied volatility
+    tbq: float = None  # Total buy quantity
+    tsq: float = None  # Total sell quantity
 
 @dataclass
 class OHLCCandle:
@@ -53,6 +63,16 @@ class OHLCCandle:
     volume: int
     timestamp: int
     candle_status: str  # "active" or "completed"
+    # Additional fields from full mode (for market feeds)
+    ltq: str = None  # Last traded quantity
+    market_level: dict = None  # Bid/ask quotes (marketLevel)
+    option_greeks: dict = None  # Option Greeks (delta, theta, gamma, vega, rho)
+    atp: float = None  # Average traded price
+    vtt: str = None  # Volume traded today
+    oi: float = None  # Open interest
+    iv: float = None  # Implied volatility
+    tbq: float = None  # Total buy quantity
+    tsq: float = None  # Total sell quantity
 
 class InstrumentSubscribeRequest(BaseModel):
     """Request model for subscribing to instruments"""
@@ -449,12 +469,13 @@ class DataService:
                             if 'ltpc' in index_data:
                                 ltpc = index_data['ltpc']
                                 
-                                # Create market data object
+                                # Create market data object (index feeds have limited fields)
                                 market_data = MarketData(
                                     instrument_key=instrument_key,
                                     ltp=ltpc.get('ltp', 0),
                                     ltt=ltpc.get('ltt', ''),
                                     change_percent=ltpc.get('cp', 0),
+                                    ltq=ltpc.get('ltq', None),  # Last traded quantity
                                     ohlc=index_data.get('marketOHLC', {}),
                                     timestamp=datetime.now()
                                 )
@@ -473,9 +494,9 @@ class DataService:
                                     "data": market_data.__dict__
                                 })
                             
-                            # Process OHLC data
+                            # Process OHLC data (pass full index_data for context)
                             if 'marketOHLC' in index_data:
-                                self._process_ohlc_data(instrument_key, index_data['marketOHLC'])
+                                self._process_ohlc_data(instrument_key, index_data['marketOHLC'], index_data)
                         
                         # Handle Market feeds (for equity/options)
                         elif 'marketFF' in full_feed:
@@ -484,12 +505,23 @@ class DataService:
                             # Process LTPC if available
                             if 'ltpc' in market_data_feed:
                                 ltpc = market_data_feed['ltpc']
+                                
+                                # Extract all available fields from marketFF
                                 market_data = MarketData(
                                     instrument_key=instrument_key,
                                     ltp=ltpc.get('ltp', 0),
                                     ltt=ltpc.get('ltt', ''),
                                     change_percent=ltpc.get('cp', 0),
+                                    ltq=ltpc.get('ltq', None),  # Last traded quantity
                                     ohlc=market_data_feed.get('marketOHLC', {}),
+                                    market_level=market_data_feed.get('marketLevel', None),  # Bid/ask quotes
+                                    option_greeks=market_data_feed.get('optionGreeks', None),  # Option Greeks
+                                    atp=market_data_feed.get('atp', None),  # Average traded price
+                                    vtt=market_data_feed.get('vtt', None),  # Volume traded today
+                                    oi=market_data_feed.get('oi', None),  # Open interest
+                                    iv=market_data_feed.get('iv', None),  # Implied volatility
+                                    tbq=market_data_feed.get('tbq', None),  # Total buy quantity
+                                    tsq=market_data_feed.get('tsq', None),  # Total sell quantity
                                     timestamp=datetime.now()
                                 )
                                 
@@ -505,17 +537,23 @@ class DataService:
                                     "data": market_data.__dict__
                                 })
                             
-                            # Process OHLC data
+                            # Process OHLC data (pass full market_data_feed for context)
                             if 'marketOHLC' in market_data_feed:
-                                self._process_ohlc_data(instrument_key, market_data_feed['marketOHLC'])
+                                self._process_ohlc_data(instrument_key, market_data_feed['marketOHLC'], market_data_feed)
                                 
         except Exception as e:
             logger.error(f"Error processing market data: {e}")
             import traceback
             traceback.print_exc()
     
-    def _process_ohlc_data(self, instrument_key: str, market_ohlc: dict):
-        """Process OHLC data from WebSocket feed"""
+    def _process_ohlc_data(self, instrument_key: str, market_ohlc: dict, feed_context: dict = None):
+        """Process OHLC data from WebSocket feed
+        
+        Args:
+            instrument_key: Instrument identifier
+            market_ohlc: OHLC data dictionary
+            feed_context: Full feed context (marketFF or indexFF) for additional fields
+        """
         try:
             if not market_ohlc or 'ohlc' not in market_ohlc:
                 return
@@ -523,6 +561,33 @@ class DataService:
             ohlc_list = market_ohlc.get('ohlc', [])
             if not isinstance(ohlc_list, list):
                 return
+            
+            # Extract additional fields from feed context (if available)
+            # For market feeds (marketFF), extract all fields; for index feeds (indexFF), only ltq is available
+            ltq = None
+            market_level = None
+            option_greeks = None
+            atp = None
+            vtt = None
+            oi = None
+            iv = None
+            tbq = None
+            tsq = None
+            
+            if feed_context:
+                # Extract ltq from ltpc if available
+                if 'ltpc' in feed_context:
+                    ltq = feed_context['ltpc'].get('ltq', None)
+                
+                # Extract additional fields (only available in marketFF, not indexFF)
+                market_level = feed_context.get('marketLevel', None)
+                option_greeks = feed_context.get('optionGreeks', None)
+                atp = feed_context.get('atp', None)
+                vtt = feed_context.get('vtt', None)
+                oi = feed_context.get('oi', None)
+                iv = feed_context.get('iv', None)
+                tbq = feed_context.get('tbq', None)
+                tsq = feed_context.get('tsq', None)
             
             # Interval mapping: Upstox format -> Internal format
             interval_map = {
@@ -583,7 +648,7 @@ class DataService:
                             self._cache_ohlc_candle(last_candle)
                             logger.info(f"Cached completed 1min candle: {instrument_key} ts={last_timestamp}")
                     
-                    # Create current candle object (active)
+                    # Create current candle object (active) with additional fields
                     candle = OHLCCandle(
                         instrument_key=instrument_key,
                         interval=interval,
@@ -593,14 +658,23 @@ class DataService:
                         close=float(ohlc_item.get('close', 0)),
                         volume=volume,
                         timestamp=current_timestamp,
-                        candle_status="active"  # Current candle is always active
+                        candle_status="active",  # Current candle is always active
+                        ltq=ltq,
+                        market_level=market_level,
+                        option_greeks=option_greeks,
+                        atp=atp,
+                        vtt=vtt,
+                        oi=oi,
+                        iv=iv,
+                        tbq=tbq,
+                        tsq=tsq
                     )
                     
                     # Update tracking
                     last_state['last_timestamp'] = current_timestamp
                     last_state['last_candle'] = candle
                 
-                # Handle 1d (daily) candles: always cache (updates throughout the day)
+                # Handle 1d (daily) candles: always cache (updates throughout the day) with additional fields
                 elif interval == "1day":
                     candle = OHLCCandle(
                         instrument_key=instrument_key,
@@ -611,7 +685,16 @@ class DataService:
                         close=float(ohlc_item.get('close', 0)),
                         volume=volume,
                         timestamp=current_timestamp,
-                        candle_status="completed"  # Daily candles are always completed
+                        candle_status="completed",  # Daily candles are always completed
+                        ltq=ltq,
+                        market_level=market_level,
+                        option_greeks=option_greeks,
+                        atp=atp,
+                        vtt=vtt,
+                        oi=oi,
+                        iv=iv,
+                        tbq=tbq,
+                        tsq=tsq
                     )
                     
                     # Cache daily candle every time (updates throughout the day)
