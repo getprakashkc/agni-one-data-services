@@ -733,7 +733,17 @@ class DataService:
                 "close": candle.close,
                 "volume": candle.volume,
                 "timestamp": candle.timestamp,
-                "candle_status": candle.candle_status
+                "candle_status": candle.candle_status,
+                # Additional fields from full mode
+                "ltq": candle.ltq,
+                "market_level": candle.market_level,
+                "option_greeks": candle.option_greeks,
+                "atp": candle.atp,
+                "vtt": candle.vtt,
+                "oi": candle.oi,
+                "iv": candle.iv,
+                "tbq": candle.tbq,
+                "tsq": candle.tsq
             }
             # Cache for 24 hours (candles are historical data)
             self.redis_client.setex(cache_key, 86400, json.dumps(candle_data))
