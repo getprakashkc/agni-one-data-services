@@ -903,31 +903,42 @@ class DataService:
         """Calculate trading date from timestamp
         
         For Indian markets: Trading day is 9:15 AM - 3:30 PM IST
-        If timestamp is before 9:15 AM, it belongs to previous trading day
+        If timestamp is before 9:15 AM on the same day, it still belongs to that day.
+        If timestamp is before 9:15 AM on a previous day, it belongs to the previous trading day.
         
         Args:
-            timestamp_ms: Timestamp in milliseconds since epoch
+            timestamp_ms: Timestamp in milliseconds since epoch (UTC)
             
         Returns:
             Trading date string in YYYY-MM-DD format
         """
-        # Convert timestamp to IST datetime
+        # Convert UTC timestamp to IST datetime
         dt = datetime.fromtimestamp(timestamp_ms / 1000, tz=IST)
         
-        # If before 9:15 AM, it's from previous trading day
+        # Get current IST date for comparison
+        now_ist = get_ist_now()
+        current_date = now_ist.date()
+        timestamp_date = dt.date()
+        
+        # If timestamp is before 9:15 AM
         if dt.hour < 9 or (dt.hour == 9 and dt.minute < 15):
-            dt = dt - timedelta(days=1)
+            # Only subtract a day if it's from a previous calendar day
+            # If it's from today before 9:15 AM, it's still today's trading day
+            if timestamp_date < current_date:
+                # This is from a previous day before 9:15 AM, belongs to previous trading day
+                dt = dt - timedelta(days=1)
+            # If timestamp_date == current_date, it's today before 9:15 AM, keep today
         
         return dt.strftime("%Y-%m-%d")
     
     def _get_trading_date(self, timestamp_ms: int) -> str:
         """Get trading date in YYYY-MM-DD format from timestamp
         
-        Uses in-memory cache (self.current_trading_date) for performance.
-        Only calculates if cache is missing or if timestamp indicates a different trading day.
+        Returns the trading date for the given timestamp (for Redis key).
+        Only updates global cache if calculated date is >= current cached date.
         
         Args:
-            timestamp_ms: Timestamp in milliseconds since epoch
+            timestamp_ms: Timestamp in milliseconds since epoch (UTC)
             
         Returns:
             Trading date string in YYYY-MM-DD format
@@ -935,14 +946,14 @@ class DataService:
         # Calculate trading date from timestamp
         calculated_date = self._calculate_trading_date(timestamp_ms)
         
-        # If we have cached trading date and it matches, use it (fast path)
-        if self.current_trading_date and self.current_trading_date == calculated_date:
-            return self.current_trading_date
+        # Update global cache only if:
+        # 1. Cache is missing, OR
+        # 2. Calculated date is newer or equal to cached date (current day's candles)
+        if (self.current_trading_date is None) or (calculated_date >= self.current_trading_date):
+            self.current_trading_date = calculated_date
+            self._update_trading_date_in_redis(calculated_date)
         
-        # Trading date changed or cache is missing - update both memory and Redis
-        self.current_trading_date = calculated_date
-        self._update_trading_date_in_redis(calculated_date)
-        
+        # Always return the calculated date for this timestamp (for Redis key)
         return calculated_date
     
     def _get_or_init_trading_date(self) -> str:
