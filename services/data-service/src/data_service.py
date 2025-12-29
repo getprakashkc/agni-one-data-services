@@ -123,6 +123,10 @@ class DataService:
         
         # Track currently subscribed instruments from Upstox
         self.subscribed_instruments: Set[str] = set()
+        
+        # Track last candle state for transition detection (I1 candles)
+        # Format: {instrument_key: {interval: {last_timestamp: int, last_candle: OHLCCandle}}}
+        self.last_candle_state: Dict[str, Dict[str, Dict]] = {}
 
     def reload_tokens(self, access_tokens: List[str]):
         """
@@ -520,55 +524,107 @@ class DataService:
             if not isinstance(ohlc_list, list):
                 return
             
-            current_time = int(time.time() * 1000)  # Current timestamp in milliseconds
+            # Interval mapping: Upstox format -> Internal format
+            interval_map = {
+                "I1": "1min",   # 1-minute candle
+                "1d": "1day"    # Daily candle
+            }
             
             for ohlc_item in ohlc_list:
                 if not isinstance(ohlc_item, dict):
                     continue
                 
-                interval = ohlc_item.get('interval', '')
+                upstox_interval = ohlc_item.get('interval', '')
+                if not upstox_interval:
+                    continue
+                
+                # Map interval (skip if not I1 or 1d)
+                interval = interval_map.get(upstox_interval)
                 if not interval:
                     continue
                 
-                # Determine if candle is active or completed
-                candle_timestamp = ohlc_item.get('ts', 0)
-                candle_status = "active"  # Default to active
+                # Get timestamp (handle string format from Upstox)
+                ts_str = ohlc_item.get('ts', '0')
+                if isinstance(ts_str, str):
+                    current_timestamp = int(ts_str) if ts_str.isdigit() else 0
+                else:
+                    current_timestamp = int(ts_str) if ts_str else 0
                 
-                # Simple heuristic: if timestamp is more than 2 minutes old for 1min candles, likely completed
-                # For other intervals, use interval-based logic
-                if interval == "1min" and candle_timestamp > 0:
-                    time_diff = (current_time - candle_timestamp) / 1000  # seconds
-                    if time_diff > 120:  # More than 2 minutes old
-                        candle_status = "completed"
-                elif interval in ["5min", "15min", "30min"] and candle_timestamp > 0:
-                    # For longer intervals, check if timestamp is significantly older than interval
-                    interval_seconds = self._interval_to_seconds(interval)
-                    time_diff = (current_time - candle_timestamp) / 1000
-                    if time_diff > interval_seconds * 1.5:  # 1.5x the interval
-                        candle_status = "completed"
+                if current_timestamp == 0:
+                    continue
                 
-                # Create OHLC candle object
-                candle = OHLCCandle(
-                    instrument_key=instrument_key,
-                    interval=interval,
-                    open=ohlc_item.get('open', 0),
-                    high=ohlc_item.get('high', 0),
-                    low=ohlc_item.get('low', 0),
-                    close=ohlc_item.get('close', 0),
-                    volume=ohlc_item.get('vol', 0),
-                    timestamp=candle_timestamp,
-                    candle_status=candle_status
-                )
+                # Handle volume (can be string or number)
+                vol = ohlc_item.get('vol', 0)
+                if isinstance(vol, str):
+                    volume = int(vol) if vol.isdigit() else 0
+                else:
+                    volume = int(vol) if vol else 0
                 
-                # Cache completed candles
-                if candle_status == "completed":
+                # Handle I1 (1-minute) candles: track transitions
+                if interval == "1min":
+                    # Initialize tracking if needed
+                    if instrument_key not in self.last_candle_state:
+                        self.last_candle_state[instrument_key] = {}
+                    if interval not in self.last_candle_state[instrument_key]:
+                        self.last_candle_state[instrument_key][interval] = {
+                            'last_timestamp': 0,
+                            'last_candle': None
+                        }
+                    
+                    last_state = self.last_candle_state[instrument_key][interval]
+                    last_timestamp = last_state['last_timestamp']
+                    
+                    # Detect new candle: timestamp changed
+                    if last_timestamp > 0 and current_timestamp != last_timestamp:
+                        # New candle detected! Cache the previous one
+                        if last_state['last_candle']:
+                            last_candle = last_state['last_candle']
+                            last_candle.candle_status = "completed"
+                            self._cache_ohlc_candle(last_candle)
+                            logger.info(f"Cached completed 1min candle: {instrument_key} ts={last_timestamp}")
+                    
+                    # Create current candle object (active)
+                    candle = OHLCCandle(
+                        instrument_key=instrument_key,
+                        interval=interval,
+                        open=float(ohlc_item.get('open', 0)),
+                        high=float(ohlc_item.get('high', 0)),
+                        low=float(ohlc_item.get('low', 0)),
+                        close=float(ohlc_item.get('close', 0)),
+                        volume=volume,
+                        timestamp=current_timestamp,
+                        candle_status="active"  # Current candle is always active
+                    )
+                    
+                    # Update tracking
+                    last_state['last_timestamp'] = current_timestamp
+                    last_state['last_candle'] = candle
+                
+                # Handle 1d (daily) candles: always cache (updates throughout the day)
+                elif interval == "1day":
+                    candle = OHLCCandle(
+                        instrument_key=instrument_key,
+                        interval=interval,
+                        open=float(ohlc_item.get('open', 0)),
+                        high=float(ohlc_item.get('high', 0)),
+                        low=float(ohlc_item.get('low', 0)),
+                        close=float(ohlc_item.get('close', 0)),
+                        volume=volume,
+                        timestamp=current_timestamp,
+                        candle_status="completed"  # Daily candles are always completed
+                    )
+                    
+                    # Cache daily candle every time (updates throughout the day)
                     self._cache_ohlc_candle(candle)
+                    logger.debug(f"Cached daily candle: {instrument_key} ts={current_timestamp}")
                 
-                # Broadcast to OHLC subscribers
+                # Broadcast to subscribers
                 self._broadcast_ohlc_update(candle)
                 
         except Exception as e:
             logger.error(f"Error processing OHLC data for {instrument_key}: {e}")
+            import traceback
+            traceback.print_exc()
     
     def _interval_to_seconds(self, interval: str) -> int:
         """Convert interval string to seconds"""
