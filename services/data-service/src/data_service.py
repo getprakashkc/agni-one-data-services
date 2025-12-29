@@ -83,6 +83,11 @@ class InstrumentUnsubscribeRequest(BaseModel):
     """Request model for unsubscribing from instruments"""
     instruments: List[str]
 
+class InstrumentChangeModeRequest(BaseModel):
+    """Request model for changing instrument subscription mode"""
+    instruments: List[str]
+    mode: str  # "full", "ltpc", "option_greeks", or "full_d30"
+
 class DataService:
     """Core data service for market data management with support for multiple Upstox accounts for redundancy"""
     
@@ -128,8 +133,11 @@ class DataService:
         self.portfolio_streamers: List[upstox_client.PortfolioDataStreamer] = []
         
         # Track connection status for each streamer
-        self.market_streamer_status: List[Dict[str, Any]] = []  # [{"connected": bool, "last_error": str, "token_index": int}]
+        self.market_streamer_status: List[Dict[str, Any]] = []  # [{"connected": bool, "last_error": str, "token_index": int, "reconnecting": bool}]
         self.portfolio_streamer_status: List[Dict[str, Any]] = []
+        
+        # Track instrument modes: instrument_key -> mode (default: "full")
+        self.instrument_modes: Dict[str, str] = {}
         
         # Subscribers: client_id -> (websocket, subscriptions_set)
         # subscriptions_set can contain "*" for all instruments, or specific instrument_keys
@@ -148,10 +156,6 @@ class DataService:
         # Track last candle state for transition detection (I1 candles)
         # Format: {instrument_key: {interval: {last_timestamp: int, last_candle: OHLCCandle}}}
         self.last_candle_state: Dict[str, Dict[str, Dict]] = {}
-        
-        # Master data: trading date (cached in memory, updated daily at 8 AM)
-        # This avoids Redis lookups for every candle - trading date only changes once per day
-        self.current_trading_date: str = None
         
         # Master data: trading date (cached in memory, updated daily at 8 AM)
         # This avoids Redis lookups for every candle - trading date only changes once per day
@@ -196,6 +200,7 @@ class DataService:
         self.portfolio_streamers = []
         self.market_streamer_status = []
         self.portfolio_streamer_status = []
+        # Note: instrument_modes are preserved during token reload
 
         # Restart streams with the current subscribed instruments
         instruments = self.get_subscribed_instruments()
@@ -250,19 +255,40 @@ class DataService:
                         self._on_market_close(close_status_code, close_msg, token_idx)
                     return handler
                 
+                def make_reconnecting_handler(token_idx):
+                    def handler(message):
+                        self._on_market_reconnecting(message, token_idx)
+                    return handler
+                
+                def make_auto_reconnect_stopped_handler(token_idx):
+                    def handler(message):
+                        self._on_market_auto_reconnect_stopped(message, token_idx)
+                    return handler
+                
                 # Set event handlers
                 streamer.on("open", make_open_handler(idx))
                 streamer.on("message", make_message_handler(idx))
                 streamer.on("error", make_error_handler(idx))
                 streamer.on("close", make_close_handler(idx))
+                streamer.on("reconnecting", make_reconnecting_handler(idx))
+                streamer.on("autoReconnectStopped", make_auto_reconnect_stopped_handler(idx))
+                
+                # Enable auto-reconnect (10 second interval, 5 retries)
+                streamer.auto_reconnect(True, interval=10, retry_count=5)
                 
                 # Initialize status tracking
                 self.market_streamer_status.append({
                     "connected": False,
                     "last_error": None,
                     "token_index": idx,
-                    "last_connected_at": None
+                    "last_connected_at": None,
+                    "reconnecting": False,
+                    "reconnect_attempts": 0
                 })
+                
+                # Initialize instrument modes to "full" (default)
+                for inst in instruments:
+                    self.instrument_modes[inst] = "full"
                 
                 # Connect streamer
                 streamer.connect()
@@ -277,7 +303,9 @@ class DataService:
                     "connected": False,
                     "last_error": str(e),
                     "token_index": idx,
-                    "last_connected_at": None
+                    "last_connected_at": None,
+                    "reconnecting": False,
+                    "reconnect_attempts": 0
                 })
                 self.market_streamers.append(None)
     
@@ -310,6 +338,7 @@ class DataService:
             
             for idx, streamer in enumerate(active_streamers):
                 try:
+                    # Use default mode "full" for new instruments
                     streamer.subscribe(new_instruments, "full")
                     success_count += 1
                 except Exception as e:
@@ -320,6 +349,9 @@ class DataService:
             # Update tracked subscriptions if at least one streamer succeeded
             if success_count > 0:
                 self.subscribed_instruments.update(new_instruments)
+                # Initialize instrument modes to "full" (default)
+                for inst in new_instruments:
+                    self.instrument_modes[inst] = "full"
                 logger.info(f"Successfully subscribed to {len(new_instruments)} new instruments on {success_count}/{len(active_streamers)} streamers: {new_instruments}")
                 
                 message = f"Successfully subscribed to {len(new_instruments)} instruments on {success_count}/{len(active_streamers)} streamers"
@@ -372,6 +404,9 @@ class DataService:
             # Update tracked subscriptions if at least one streamer succeeded
             if success_count > 0:
                 self.subscribed_instruments.difference_update(instruments_to_remove)
+                # Remove instrument modes for unsubscribed instruments
+                for inst in instruments_to_remove:
+                    self.instrument_modes.pop(inst, None)
                 logger.info(f"Successfully unsubscribed from {len(instruments_to_remove)} instruments on {success_count}/{len(active_streamers)} streamers: {instruments_to_remove}")
                 
                 message = f"Successfully unsubscribed from {len(instruments_to_remove)} instruments on {success_count}/{len(active_streamers)} streamers"
@@ -388,6 +423,68 @@ class DataService:
     def get_subscribed_instruments(self) -> List[str]:
         """Get list of currently subscribed instruments"""
         return sorted(list(self.subscribed_instruments))
+    
+    def change_instrument_mode(self, instruments: List[str], mode: str) -> Tuple[bool, str]:
+        """Change subscription mode for instruments dynamically across all active streamers
+        
+        Args:
+            instruments: List of instrument keys to change mode for
+            mode: New mode ("full", "ltpc", "option_greeks", or "full_d30")
+            
+        Returns:
+            Tuple of (success: bool, message: str)
+        """
+        active_streamers = [s for s in self.market_streamers if s is not None]
+        if not active_streamers:
+            return False, "No active market data streamers available"
+        
+        if not instruments:
+            return False, "No instruments provided"
+        
+        # Validate mode
+        valid_modes = ["full", "ltpc", "option_greeks", "full_d30"]
+        if mode not in valid_modes:
+            return False, f"Invalid mode: {mode}. Valid modes: {', '.join(valid_modes)}"
+        
+        # Check if all instruments are subscribed
+        missing_instruments = [inst for inst in instruments if inst not in self.subscribed_instruments]
+        if missing_instruments:
+            return False, f"Instruments not subscribed: {missing_instruments}"
+        
+        try:
+            # Change mode on all active streamers
+            success_count = 0
+            errors = []
+            
+            for idx, streamer in enumerate(active_streamers):
+                try:
+                    streamer.change_mode(instruments, mode)
+                    success_count += 1
+                except Exception as e:
+                    error_msg = f"Streamer {idx + 1}: {str(e)}"
+                    errors.append(error_msg)
+                    logger.warning(f"Failed to change mode on streamer {idx + 1}: {e}")
+            
+            # Update tracked modes if at least one streamer succeeded
+            if success_count > 0:
+                for inst in instruments:
+                    self.instrument_modes[inst] = mode
+                logger.info(f"Successfully changed mode to '{mode}' for {len(instruments)} instruments on {success_count}/{len(active_streamers)} streamers: {instruments}")
+                
+                message = f"Successfully changed mode to '{mode}' for {len(instruments)} instruments on {success_count}/{len(active_streamers)} streamers"
+                if errors:
+                    message += f". Errors: {', '.join(errors)}"
+                return True, message
+            else:
+                return False, f"Failed to change mode on all streamers: {', '.join(errors)}"
+            
+        except Exception as e:
+            logger.error(f"Error changing mode for instruments {instruments}: {e}")
+            return False, f"Failed to change mode: {str(e)}"
+    
+    def get_instrument_modes(self) -> Dict[str, str]:
+        """Get current mode for all subscribed instruments"""
+        return self.instrument_modes.copy()
     
     def start_portfolio_stream(self):
         """Start portfolio data streaming with multiple streamers for redundancy"""
@@ -425,18 +522,35 @@ class DataService:
                         self._on_portfolio_close(close_status_code, close_msg, token_idx)
                     return handler
                 
+                def make_portfolio_reconnecting_handler(token_idx):
+                    def handler(message):
+                        self._on_portfolio_reconnecting(message, token_idx)
+                    return handler
+                
+                def make_portfolio_auto_reconnect_stopped_handler(token_idx):
+                    def handler(message):
+                        self._on_portfolio_auto_reconnect_stopped(message, token_idx)
+                    return handler
+                
                 # Set event handlers
                 streamer.on("open", make_portfolio_open_handler(idx))
                 streamer.on("message", make_portfolio_message_handler(idx))
                 streamer.on("error", make_portfolio_error_handler(idx))
                 streamer.on("close", make_portfolio_close_handler(idx))
+                streamer.on("reconnecting", make_portfolio_reconnecting_handler(idx))
+                streamer.on("autoReconnectStopped", make_portfolio_auto_reconnect_stopped_handler(idx))
+                
+                # Enable auto-reconnect (10 second interval, 5 retries)
+                streamer.auto_reconnect(True, interval=10, retry_count=5)
                 
                 # Initialize status tracking
                 self.portfolio_streamer_status.append({
                     "connected": False,
                     "last_error": None,
                     "token_index": idx,
-                    "last_connected_at": None
+                    "last_connected_at": None,
+                    "reconnecting": False,
+                    "reconnect_attempts": 0
                 })
                 
                 # Connect streamer
@@ -452,7 +566,9 @@ class DataService:
                     "connected": False,
                     "last_error": str(e),
                     "token_index": idx,
-                    "last_connected_at": None
+                    "last_connected_at": None,
+                    "reconnecting": False,
+                    "reconnect_attempts": 0
                 })
                 self.portfolio_streamers.append(None)
     
@@ -463,6 +579,31 @@ class DataService:
             self.market_streamer_status[streamer_index]["connected"] = True
             self.market_streamer_status[streamer_index]["last_error"] = None
             self.market_streamer_status[streamer_index]["last_connected_at"] = format_ist_for_redis()
+            self.market_streamer_status[streamer_index]["reconnecting"] = False
+            self.market_streamer_status[streamer_index]["reconnect_attempts"] = 0
+    
+    def _on_market_reconnecting(self, message, streamer_index: int = 0):
+        """Handle market data reconnecting event"""
+        logger.warning(f"Market data reconnecting (streamer {streamer_index + 1}/{len(self.market_streamers)}): {message}")
+        if streamer_index < len(self.market_streamer_status):
+            self.market_streamer_status[streamer_index]["reconnecting"] = True
+            self.market_streamer_status[streamer_index]["connected"] = False
+            # Extract attempt number from message if possible
+            if isinstance(message, str) and "/" in message:
+                try:
+                    parts = message.split("/")
+                    if len(parts) >= 2:
+                        self.market_streamer_status[streamer_index]["reconnect_attempts"] = int(parts[0].split()[-1])
+                except (ValueError, IndexError):
+                    pass
+    
+    def _on_market_auto_reconnect_stopped(self, message, streamer_index: int = 0):
+        """Handle market data auto-reconnect stopped event"""
+        logger.error(f"Market data auto-reconnect stopped (streamer {streamer_index + 1}/{len(self.market_streamers)}): {message}")
+        if streamer_index < len(self.market_streamer_status):
+            self.market_streamer_status[streamer_index]["reconnecting"] = False
+            self.market_streamer_status[streamer_index]["connected"] = False
+            self.market_streamer_status[streamer_index]["last_error"] = f"Auto-reconnect stopped: {message}"
     
     def _on_market_message(self, message, streamer_index: int = 0):
         """Process market data messages from any streamer"""
@@ -1022,6 +1163,31 @@ class DataService:
             self.portfolio_streamer_status[streamer_index]["connected"] = True
             self.portfolio_streamer_status[streamer_index]["last_error"] = None
             self.portfolio_streamer_status[streamer_index]["last_connected_at"] = format_ist_for_redis()
+            self.portfolio_streamer_status[streamer_index]["reconnecting"] = False
+            self.portfolio_streamer_status[streamer_index]["reconnect_attempts"] = 0
+    
+    def _on_portfolio_reconnecting(self, message, streamer_index: int = 0):
+        """Handle portfolio reconnecting event"""
+        logger.warning(f"Portfolio reconnecting (streamer {streamer_index + 1}/{len(self.portfolio_streamers)}): {message}")
+        if streamer_index < len(self.portfolio_streamer_status):
+            self.portfolio_streamer_status[streamer_index]["reconnecting"] = True
+            self.portfolio_streamer_status[streamer_index]["connected"] = False
+            # Extract attempt number from message if possible
+            if isinstance(message, str) and "/" in message:
+                try:
+                    parts = message.split("/")
+                    if len(parts) >= 2:
+                        self.portfolio_streamer_status[streamer_index]["reconnect_attempts"] = int(parts[0].split()[-1])
+                except (ValueError, IndexError):
+                    pass
+    
+    def _on_portfolio_auto_reconnect_stopped(self, message, streamer_index: int = 0):
+        """Handle portfolio auto-reconnect stopped event"""
+        logger.error(f"Portfolio auto-reconnect stopped (streamer {streamer_index + 1}/{len(self.portfolio_streamers)}): {message}")
+        if streamer_index < len(self.portfolio_streamer_status):
+            self.portfolio_streamer_status[streamer_index]["reconnecting"] = False
+            self.portfolio_streamer_status[streamer_index]["connected"] = False
+            self.portfolio_streamer_status[streamer_index]["last_error"] = f"Auto-reconnect stopped: {message}"
     
     def _broadcast_to_subscribers(self, message):
         """Broadcast message to subscribed WebSocket clients only"""
@@ -1892,6 +2058,56 @@ async def unsubscribe_instruments(request: InstrumentUnsubscribeRequest):
         }
     else:
         raise HTTPException(status_code=500, detail=message)
+
+@app.post("/api/instruments/change-mode")
+async def change_instrument_mode(request: InstrumentChangeModeRequest):
+    """Change subscription mode for instruments dynamically
+    
+    Changes the subscription mode for already subscribed instruments without disconnecting.
+    Default mode is "full". Available modes:
+    - "full": Comprehensive information including latest trade prices, D5 depth, candlestick data
+    - "ltpc": Last trade price, time, quantity, and closing price
+    - "option_greeks": Option Greeks only (delta, theta, gamma, vega, rho)
+    - "full_d30": Full mode plus 30 market level quotes
+    
+    Example:
+        POST /api/instruments/change-mode
+        {
+            "instruments": ["NSE_OPT|...", "NSE_OPT|..."],
+            "mode": "option_greeks"
+        }
+    """
+    if not request.instruments:
+        raise HTTPException(status_code=400, detail="instruments list cannot be empty")
+    
+    if not request.mode:
+        raise HTTPException(status_code=400, detail="mode cannot be empty")
+    
+    success, message = data_service.change_instrument_mode(request.instruments, request.mode)
+    
+    if success:
+        return {
+            "status": "success",
+            "message": message,
+            "instruments": request.instruments,
+            "mode": request.mode,
+            "instrument_modes": data_service.get_instrument_modes(),
+            "timestamp": format_ist_for_redis()
+        }
+    else:
+        raise HTTPException(status_code=500, detail=message)
+
+@app.get("/api/instruments/modes")
+async def get_instrument_modes():
+    """Get current subscription modes for all instruments
+    
+    Returns a mapping of instrument_key -> mode for all subscribed instruments.
+    """
+    return {
+        "instrument_modes": data_service.get_instrument_modes(),
+        "count": len(data_service.instrument_modes),
+        "timestamp": format_ist_for_redis()
+    }
 
 @app.get("/api/health")
 async def health_check():
