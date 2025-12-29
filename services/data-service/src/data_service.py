@@ -902,9 +902,9 @@ class DataService:
     def _calculate_trading_date(self, timestamp_ms: int) -> str:
         """Calculate trading date from timestamp
         
-        For Indian markets: Trading day is 9:15 AM - 3:30 PM IST
-        If timestamp is before 9:15 AM on the same day, it still belongs to that day.
-        If timestamp is before 9:15 AM on a previous day, it belongs to the previous trading day.
+        For Indian markets: Trading day is 9:00 AM - 3:30 PM IST (premarket starts around 9:08 AM)
+        If timestamp is before 9:00 AM on the same day, it still belongs to that day.
+        If timestamp is before 9:00 AM on a previous day, it belongs to the previous trading day.
         
         Args:
             timestamp_ms: Timestamp in milliseconds since epoch (UTC)
@@ -920,14 +920,14 @@ class DataService:
         current_date = now_ist.date()
         timestamp_date = dt.date()
         
-        # If timestamp is before 9:15 AM
-        if dt.hour < 9 or (dt.hour == 9 and dt.minute < 15):
+        # If timestamp is before 9:00 AM
+        if dt.hour < 9:
             # Only subtract a day if it's from a previous calendar day
-            # If it's from today before 9:15 AM, it's still today's trading day
+            # If it's from today before 9:00 AM, it's still today's trading day
             if timestamp_date < current_date:
-                # This is from a previous day before 9:15 AM, belongs to previous trading day
+                # This is from a previous day before 9:00 AM, belongs to previous trading day
                 dt = dt - timedelta(days=1)
-            # If timestamp_date == current_date, it's today before 9:15 AM, keep today
+            # If timestamp_date == current_date, it's today before 9:00 AM, keep today
         
         return dt.strftime("%Y-%m-%d")
     
@@ -989,7 +989,7 @@ class DataService:
         """
         Background task: update master data (trading date) once per day at 8:00 AM IST.
         
-        This ensures trading date is ready before market opens at 9:15 AM IST.
+        This ensures trading date is ready before premarket starts at 9:00 AM IST.
         """
         logger.info("🕒 Starting daily master data scheduler (8:00 AM IST)")
         
