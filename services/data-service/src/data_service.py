@@ -7,8 +7,8 @@ Handles WebSocket connections, market data processing, and data distribution
 import sys
 import os
 # Add shared code to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'shared', 'upstox_client'))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'shared', 'utils'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'shared', 'upstox_client'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'shared', 'utils'))
 
 import asyncio
 import json
