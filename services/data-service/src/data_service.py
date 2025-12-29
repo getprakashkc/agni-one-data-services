@@ -18,10 +18,11 @@ import uuid
 import requests
 from typing import Dict, List, Callable, Set, Tuple, Any
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
 import upstox_client
 import redis
+from ist_utils import get_ist_now, get_ist_datetime, get_ist_date_string, format_ist_for_redis, IST
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -147,6 +148,14 @@ class DataService:
         # Track last candle state for transition detection (I1 candles)
         # Format: {instrument_key: {interval: {last_timestamp: int, last_candle: OHLCCandle}}}
         self.last_candle_state: Dict[str, Dict[str, Dict]] = {}
+        
+        # Master data: trading date (cached in memory, updated daily at 8 AM)
+        # This avoids Redis lookups for every candle - trading date only changes once per day
+        self.current_trading_date: str = None
+        
+        # Master data: trading date (cached in memory, updated daily at 8 AM)
+        # This avoids Redis lookups for every candle - trading date only changes once per day
+        self.current_trading_date: str = None
 
     def reload_tokens(self, access_tokens: List[str]):
         """
@@ -453,7 +462,7 @@ class DataService:
         if streamer_index < len(self.market_streamer_status):
             self.market_streamer_status[streamer_index]["connected"] = True
             self.market_streamer_status[streamer_index]["last_error"] = None
-            self.market_streamer_status[streamer_index]["last_connected_at"] = datetime.now().isoformat()
+            self.market_streamer_status[streamer_index]["last_connected_at"] = format_ist_for_redis()
     
     def _on_market_message(self, message, streamer_index: int = 0):
         """Process market data messages from any streamer"""
@@ -477,7 +486,7 @@ class DataService:
                                     change_percent=ltpc.get('cp', 0),
                                     ltq=ltpc.get('ltq', None),  # Last traded quantity
                                     ohlc=index_data.get('marketOHLC', {}),
-                                    timestamp=datetime.now()
+                                    timestamp=get_ist_now()
                                 )
                                 
                                 # Cache the data
@@ -522,7 +531,7 @@ class DataService:
                                     iv=market_data_feed.get('iv', None),  # Implied volatility
                                     tbq=market_data_feed.get('tbq', None),  # Total buy quantity
                                     tsq=market_data_feed.get('tsq', None),  # Total sell quantity
-                                    timestamp=datetime.now()
+                                    timestamp=get_ist_now()
                                 )
                                 
                                 self.market_data_cache[instrument_key] = market_data
@@ -720,10 +729,160 @@ class DataService:
         }
         return interval_map.get(interval, 60)
     
-    def _cache_ohlc_candle(self, candle: OHLCCandle):
-        """Cache completed OHLC candle in Redis"""
+    def _get_trading_date_from_redis(self) -> str:
+        """Get current trading date from Redis master data
+        
+        Returns:
+            Trading date string in YYYY-MM-DD format, or None if not found
+        """
         try:
-            cache_key = f"ohlc:{candle.instrument_key}:{candle.interval}:{candle.timestamp}"
+            trading_date = self.redis_client.get("master_data:trading_date")
+            if trading_date:
+                return trading_date.decode('utf-8')
+        except Exception as e:
+            logger.warning(f"Error getting trading date from Redis: {e}")
+        return None
+    
+    def _update_trading_date_in_redis(self, trading_date: str):
+        """Update trading date in Redis master data
+        
+        Args:
+            trading_date: Trading date string in YYYY-MM-DD format
+        """
+        try:
+            # Store trading date with no expiration (master data)
+            self.redis_client.set("master_data:trading_date", trading_date)
+            # Store update timestamp
+            self.redis_client.set("master_data:trading_date:updated_at", format_ist_for_redis())
+            logger.info(f"✅ Updated trading date in Redis: {trading_date}")
+        except Exception as e:
+            logger.error(f"Error updating trading date in Redis: {e}")
+    
+    def _calculate_trading_date(self, timestamp_ms: int) -> str:
+        """Calculate trading date from timestamp
+        
+        For Indian markets: Trading day is 9:15 AM - 3:30 PM IST
+        If timestamp is before 9:15 AM, it belongs to previous trading day
+        
+        Args:
+            timestamp_ms: Timestamp in milliseconds since epoch
+            
+        Returns:
+            Trading date string in YYYY-MM-DD format
+        """
+        # Convert timestamp to IST datetime
+        dt = datetime.fromtimestamp(timestamp_ms / 1000, tz=IST)
+        
+        # If before 9:15 AM, it's from previous trading day
+        if dt.hour < 9 or (dt.hour == 9 and dt.minute < 15):
+            dt = dt - timedelta(days=1)
+        
+        return dt.strftime("%Y-%m-%d")
+    
+    def _get_trading_date(self, timestamp_ms: int) -> str:
+        """Get trading date in YYYY-MM-DD format from timestamp
+        
+        Uses in-memory cache (self.current_trading_date) for performance.
+        Only calculates if cache is missing or if timestamp indicates a different trading day.
+        
+        Args:
+            timestamp_ms: Timestamp in milliseconds since epoch
+            
+        Returns:
+            Trading date string in YYYY-MM-DD format
+        """
+        # Calculate trading date from timestamp
+        calculated_date = self._calculate_trading_date(timestamp_ms)
+        
+        # If we have cached trading date and it matches, use it (fast path)
+        if self.current_trading_date and self.current_trading_date == calculated_date:
+            return self.current_trading_date
+        
+        # Trading date changed or cache is missing - update both memory and Redis
+        self.current_trading_date = calculated_date
+        self._update_trading_date_in_redis(calculated_date)
+        
+        return calculated_date
+    
+    def _get_or_init_trading_date(self) -> str:
+        """Get current trading date from Redis or calculate and store if missing
+        
+        Used during startup to initialize in-memory cache.
+        Updates both memory cache and Redis.
+        
+        Returns:
+            Trading date string in YYYY-MM-DD format
+        """
+        # Try to get from Redis first
+        cached_date = self._get_trading_date_from_redis()
+        
+        if cached_date:
+            # Load into memory cache
+            self.current_trading_date = cached_date
+            logger.info(f"✅ Loaded trading date from Redis: {cached_date}")
+            return cached_date
+        
+        # Calculate current trading date
+        current_timestamp = int(time.time() * 1000)
+        calculated_date = self._calculate_trading_date(current_timestamp)
+        
+        # Store in both memory cache and Redis
+        self.current_trading_date = calculated_date
+        self._update_trading_date_in_redis(calculated_date)
+        logger.info(f"✅ Calculated and stored trading date: {calculated_date}")
+        
+        return calculated_date
+    
+    async def daily_master_data_scheduler(self) -> None:
+        """
+        Background task: update master data (trading date) once per day at 8:00 AM IST.
+        
+        This ensures trading date is ready before market opens at 9:15 AM IST.
+        """
+        logger.info("🕒 Starting daily master data scheduler (8:00 AM IST)")
+        
+        while True:
+            try:
+                now = get_ist_now()
+                target = now.replace(hour=8, minute=0, second=0, microsecond=0)
+                if now >= target:
+                    # If we've already passed today's 8 AM, schedule for tomorrow
+                    target = target + timedelta(days=1)
+                
+                sleep_seconds = (target - now).total_seconds()
+                logger.info(
+                    f"⏰ Next scheduled master data update at {target.isoformat()} "
+                    f"(in {int(sleep_seconds)} seconds)"
+                )
+                
+                await asyncio.sleep(sleep_seconds)
+                
+                # Update trading date for today (both memory cache and Redis)
+                current_timestamp = int(time.time() * 1000)
+                trading_date = self._calculate_trading_date(current_timestamp)
+                self.current_trading_date = trading_date
+                self._update_trading_date_in_redis(trading_date)
+                
+                logger.info(f"✅ Scheduled master data update completed: trading_date={trading_date}")
+                
+            except asyncio.CancelledError:
+                logger.info("⏹ Master data scheduler task cancelled")
+                break
+            except Exception as e:
+                logger.error(f"❌ Error in daily_master_data_scheduler loop: {e}")
+                # In case of unexpected error, wait a bit before retrying loop iteration
+                await asyncio.sleep(60)
+    
+    def _cache_ohlc_candle(self, candle: OHLCCandle):
+        """Cache completed OHLC candle in Redis using ZSET structure"""
+        try:
+            # Get trading date from timestamp
+            trading_date = self._get_trading_date(candle.timestamp)
+            
+            # ZSET key: ohlc:{trading_date}:{instrument_key}:{interval}
+            zset_key = f"ohlc:{trading_date}:{candle.instrument_key}:{candle.interval}"
+            latest_key = f"ohlc:{trading_date}:{candle.instrument_key}:{candle.interval}:latest"
+            
             candle_data = {
                 "instrument_key": candle.instrument_key,
                 "interval": candle.interval,
@@ -745,8 +904,20 @@ class DataService:
                 "tbq": candle.tbq,
                 "tsq": candle.tsq
             }
-            # Cache for 24 hours (candles are historical data)
-            self.redis_client.setex(cache_key, 86400, json.dumps(candle_data))
+            
+            candle_json = json.dumps(candle_data)
+            
+            # Add to ZSET with timestamp as score (for automatic sorting)
+            # ZADD will update if member already exists (same timestamp)
+            self.redis_client.zadd(zset_key, {candle_json: candle.timestamp})
+            
+            # Set TTL on ZSET (24 hours) - only set if key is new
+            if self.redis_client.ttl(zset_key) == -1:  # -1 means no TTL set
+                self.redis_client.expire(zset_key, 86400)
+            
+            # Update latest candle key
+            self.redis_client.setex(latest_key, 86400, candle_json)
+            
         except Exception as e:
             logger.error(f"Error caching OHLC candle: {e}")
     
@@ -850,7 +1021,7 @@ class DataService:
         if streamer_index < len(self.portfolio_streamer_status):
             self.portfolio_streamer_status[streamer_index]["connected"] = True
             self.portfolio_streamer_status[streamer_index]["last_error"] = None
-            self.portfolio_streamer_status[streamer_index]["last_connected_at"] = datetime.now().isoformat()
+            self.portfolio_streamer_status[streamer_index]["last_connected_at"] = format_ist_for_redis()
     
     def _broadcast_to_subscribers(self, message):
         """Broadcast message to subscribed WebSocket clients only"""
@@ -1073,27 +1244,36 @@ class DataService:
         except Exception as e:
             logger.error(f"Error sending historical OHLC to {client_id}: {e}")
     
-    def _get_cached_ohlc_candles(self, instrument_key: str, interval: str) -> List[dict]:
-        """Get cached OHLC candles from Redis"""
+    def _get_cached_ohlc_candles(self, instrument_key: str, interval: str, trading_date: str = None) -> List[dict]:
+        """Get cached OHLC candles from Redis using ZSET
+        
+        Args:
+            instrument_key: Instrument identifier
+            interval: Time interval (1min, 5min, etc.)
+            trading_date: Optional trading date in YYYY-MM-DD format. If None, uses current trading date.
+        """
         try:
-            pattern = f"ohlc:{instrument_key}:{interval}:*"
-            keys = []
+            # If trading_date not provided, use current trading date
+            if trading_date is None:
+                current_timestamp = int(time.time() * 1000)
+                trading_date = self._get_trading_date(current_timestamp)
             
-            # Scan for matching keys
-            cursor = 0
-            while True:
-                cursor, partial_keys = self.redis_client.scan(cursor, match=pattern, count=100)
-                keys.extend(partial_keys)
-                if cursor == 0:
-                    break
+            zset_key = f"ohlc:{trading_date}:{instrument_key}:{interval}"
+            
+            # Get all candles from ZSET (already sorted by timestamp/score)
+            # ZRANGE returns members in ascending order by score
+            candle_strings = self.redis_client.zrange(zset_key, 0, -1)
             
             candles = []
-            for key in keys:
-                candle_data = self.redis_client.get(key)
-                if candle_data:
-                    candles.append(json.loads(candle_data))
+            for candle_str in candle_strings:
+                try:
+                    candle_data = json.loads(candle_str)
+                    candles.append(candle_data)
+                except json.JSONDecodeError:
+                    logger.warning(f"Failed to parse candle data from ZSET: {candle_str[:50]}")
+                    continue
             
-            # Sort by timestamp
+            # ZSET is already sorted by timestamp (score), but ensure it's sorted
             candles.sort(key=lambda x: x.get('timestamp', 0))
             return candles
         
@@ -1120,7 +1300,7 @@ class DataService:
             unit, interval = interval_map[interval_str]
             
             # Get today's date for intraday candles
-            today = datetime.now().strftime("%Y-%m-%d")
+            today = get_ist_date_string()
             
             # Fetch intraday candles
             response = self.history_api.get_intra_day_candle_data(
@@ -1149,18 +1329,49 @@ class DataService:
             return []
     
     def _cache_ohlc_from_api(self, instrument_key: str, interval: str, candle_data: dict):
-        """Cache OHLC candle fetched from API"""
+        """Cache OHLC candle fetched from API using ZSET structure"""
         try:
             timestamp = candle_data.get('timestamp', 0)
             if timestamp == 0:
                 return
             
-            cache_key = f"ohlc:{instrument_key}:{interval}:{timestamp}"
+            # Ensure required fields are set
             candle_data["instrument_key"] = instrument_key
             candle_data["interval"] = interval
             candle_data["candle_status"] = "completed"
             
-            self.redis_client.setex(cache_key, 86400, json.dumps(candle_data))
+            # Get trading date from timestamp
+            trading_date = self._get_trading_date(timestamp)
+            
+            # ZSET key: ohlc:{trading_date}:{instrument_key}:{interval}
+            zset_key = f"ohlc:{trading_date}:{instrument_key}:{interval}"
+            latest_key = f"ohlc:{trading_date}:{instrument_key}:{interval}:latest"
+            
+            candle_json = json.dumps(candle_data)
+            
+            # Add to ZSET with timestamp as score
+            self.redis_client.zadd(zset_key, {candle_json: timestamp})
+            
+            # Set TTL on ZSET (24 hours) - only set if key is new
+            if self.redis_client.ttl(zset_key) == -1:  # -1 means no TTL set
+                self.redis_client.expire(zset_key, 86400)
+            
+            # Update latest candle if this is the most recent
+            # Check current latest timestamp
+            latest_candle_str = self.redis_client.get(latest_key)
+            if latest_candle_str:
+                try:
+                    latest_candle = json.loads(latest_candle_str)
+                    latest_timestamp = latest_candle.get('timestamp', 0)
+                    if timestamp > latest_timestamp:
+                        self.redis_client.setex(latest_key, 86400, candle_json)
+                except (json.JSONDecodeError, KeyError):
+                    # If latest is invalid, update it
+                    self.redis_client.setex(latest_key, 86400, candle_json)
+            else:
+                # No latest exists, set it
+                self.redis_client.setex(latest_key, 86400, candle_json)
+                
         except Exception as e:
             logger.error(f"Error caching OHLC from API: {e}")
     
@@ -1172,7 +1383,7 @@ class DataService:
                 "instrument_key": instrument_key,
                 "interval": interval,
                 "candles": candles,
-                "snapshot_time": datetime.now().isoformat(),
+                "snapshot_time": format_ist_for_redis(),
                 "candle_count": len(candles)
             }
             
@@ -1338,6 +1549,9 @@ async def lifespan(app: FastAPI):
     logger.info(f"Initializing DataService with {len(access_tokens)} access token(s) for redundancy")
     data_service = DataService(access_tokens)
     
+    # Initialize master data (trading date) - load from Redis or calculate
+    data_service._get_or_init_trading_date()
+    
     # Get initial instruments from environment variable or use default
     instruments_env = os.getenv("INSTRUMENTS", "").strip()
     
@@ -1360,6 +1574,14 @@ async def lifespan(app: FastAPI):
     else:
         data_service.start_market_data_stream(instruments)
     data_service.start_portfolio_stream()
+    
+    # Start background scheduler for daily master data updates at 8 AM IST
+    try:
+        asyncio.create_task(data_service.daily_master_data_scheduler())
+        logger.info("✅ Started daily master data scheduler (8:00 AM IST)")
+    except RuntimeError as e:
+        # In some environments there may be no running loop yet; log and skip scheduler
+        logger.warning(f"⚠️ Could not start daily master data scheduler: {e}")
     
     logger.info("Data service started")
     
@@ -1526,7 +1748,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     # Heartbeat response
                     await websocket.send_text(json.dumps({
                         "type": "pong",
-                        "timestamp": datetime.now().isoformat()
+                        "timestamp": format_ist_for_redis()
                     }))
                 
                 else:
@@ -1610,7 +1832,7 @@ async def get_subscribed_instruments():
     return {
         "subscribed_instruments": data_service.get_subscribed_instruments(),
         "count": len(data_service.subscribed_instruments),
-        "timestamp": datetime.now().isoformat()
+        "timestamp": format_ist_for_redis()
     }
 
 @app.post("/api/instruments/subscribe")
@@ -1637,7 +1859,7 @@ async def subscribe_instruments(request: InstrumentSubscribeRequest):
             "message": message,
             "subscribed_instruments": data_service.get_subscribed_instruments(),
             "count": len(data_service.subscribed_instruments),
-            "timestamp": datetime.now().isoformat()
+            "timestamp": format_ist_for_redis()
         }
     else:
         raise HTTPException(status_code=500, detail=message)
@@ -1666,7 +1888,7 @@ async def unsubscribe_instruments(request: InstrumentUnsubscribeRequest):
             "message": message,
             "subscribed_instruments": data_service.get_subscribed_instruments(),
             "count": len(data_service.subscribed_instruments),
-            "timestamp": datetime.now().isoformat()
+            "timestamp": format_ist_for_redis()
         }
     else:
         raise HTTPException(status_code=500, detail=message)
@@ -1684,7 +1906,7 @@ async def health_check():
     
     return {
         "status": overall_status,
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": format_ist_for_redis(),
         "active_connections": len(data_service.subscribers),
         "cached_instruments": len(data_service.market_data_cache),
         "subscribed_instruments_count": len(data_service.subscribed_instruments),
@@ -1828,7 +2050,7 @@ async def admin_reload_tokens():
     return {
         "status": "success",
         "token_count": len(deduped_tokens),
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": format_ist_for_redis(),
     }
 
 if __name__ == "__main__":
