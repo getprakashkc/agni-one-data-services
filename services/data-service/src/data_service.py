@@ -902,9 +902,8 @@ class DataService:
     def _calculate_trading_date(self, timestamp_ms: int) -> str:
         """Calculate trading date from timestamp
         
-        For Indian markets: Trading day is 9:00 AM - 3:30 PM IST (premarket starts around 9:08 AM)
-        If timestamp is before 9:00 AM on the same day, it still belongs to that day.
-        If timestamp is before 9:00 AM on a previous day, it belongs to the previous trading day.
+        Simply converts the timestamp to IST and returns the date.
+        The date refresh in the morning (8 AM scheduler) or on restart ensures correct trading date.
         
         Args:
             timestamp_ms: Timestamp in milliseconds since epoch (UTC)
@@ -912,48 +911,35 @@ class DataService:
         Returns:
             Trading date string in YYYY-MM-DD format
         """
-        # Convert UTC timestamp to IST datetime
+        # Convert UTC timestamp to IST datetime and return the date
         dt = datetime.fromtimestamp(timestamp_ms / 1000, tz=IST)
-        
-        # Get current IST date for comparison
-        now_ist = get_ist_now()
-        current_date = now_ist.date()
-        timestamp_date = dt.date()
-        
-        # If timestamp is before 9:00 AM
-        if dt.hour < 9:
-            # Only subtract a day if it's from a previous calendar day
-            # If it's from today before 9:00 AM, it's still today's trading day
-            if timestamp_date < current_date:
-                # This is from a previous day before 9:00 AM, belongs to previous trading day
-                dt = dt - timedelta(days=1)
-            # If timestamp_date == current_date, it's today before 9:00 AM, keep today
-        
         return dt.strftime("%Y-%m-%d")
     
     def _get_trading_date(self, timestamp_ms: int) -> str:
         """Get trading date in YYYY-MM-DD format from timestamp
         
-        Returns the trading date for the given timestamp (for Redis key).
-        Only updates global cache if calculated date is >= current cached date.
+        Always returns the calculated trading date from the timestamp (no manipulation).
+        This ensures OHLC candles are stored under the correct trading date based on their timestamp.
+        The global cache is updated separately for master data purposes only.
         
         Args:
             timestamp_ms: Timestamp in milliseconds since epoch (UTC)
             
         Returns:
-            Trading date string in YYYY-MM-DD format
+            Trading date string in YYYY-MM-DD format (calculated directly from timestamp)
         """
-        # Calculate trading date from timestamp
+        # Calculate trading date directly from timestamp (no manipulation)
         calculated_date = self._calculate_trading_date(timestamp_ms)
         
         # Update global cache only if:
         # 1. Cache is missing, OR
         # 2. Calculated date is newer or equal to cached date (current day's candles)
+        # Note: This cache update is for master data only, doesn't affect the returned date
         if (self.current_trading_date is None) or (calculated_date >= self.current_trading_date):
             self.current_trading_date = calculated_date
             self._update_trading_date_in_redis(calculated_date)
         
-        # Always return the calculated date for this timestamp (for Redis key)
+        # Always return the calculated date for this timestamp (used for Redis key)
         return calculated_date
     
     def _get_or_init_trading_date(self) -> str:
