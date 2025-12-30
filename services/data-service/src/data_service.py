@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
+from decimal import Decimal
 import upstox_client
 import redis
 import asyncpg
@@ -1074,6 +1075,24 @@ class DataService:
             traceback.print_exc()
             return []
     
+    def _convert_decimal_to_float(self, obj: Any) -> Any:
+        """Recursively convert Decimal values to float for JSON serialization
+        
+        Args:
+            obj: Object that may contain Decimal values
+            
+        Returns:
+            Object with Decimal values converted to float
+        """
+        if isinstance(obj, Decimal):
+            return float(obj)
+        elif isinstance(obj, dict):
+            return {key: self._convert_decimal_to_float(value) for key, value in obj.items()}
+        elif isinstance(obj, list):
+            return [self._convert_decimal_to_float(item) for item in obj]
+        else:
+            return obj
+    
     def _cache_fno_underlying_data(self, fno_data: List[Dict]) -> None:
         """Cache FNO underlying data in Redis
         
@@ -1092,10 +1111,13 @@ class DataService:
                 # Redis key: fno_und:{trading_symbol}
                 redis_key = f"fno_und:{trading_symbol}"
                 
+                # Convert Decimal values to float for JSON serialization
+                item_serializable = self._convert_decimal_to_float(item)
+                
                 # Store as JSON string
                 self.redis_client.set(
                     redis_key,
-                    json.dumps(item),
+                    json.dumps(item_serializable),
                     ex=86400 * 7  # 7 days TTL (master data, refresh daily)
                 )
                 cached_count += 1
