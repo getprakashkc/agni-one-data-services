@@ -16,12 +16,14 @@ import time
 import logging
 import uuid
 import requests
-from typing import Dict, List, Callable, Set, Tuple, Any
+from typing import Dict, List, Callable, Set, Tuple, Any, Optional
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
+from urllib.parse import urlparse
 import upstox_client
 import redis
+import asyncpg
 from ist_utils import get_ist_now, get_ist_datetime, get_ist_date_string, format_ist_for_redis, IST
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -112,6 +114,34 @@ class DataService:
         if redis_password:
             redis_kwargs["password"] = redis_password
         self.redis_client = redis.Redis(**redis_kwargs)
+        
+        # PostgreSQL connection pool for master data
+        # DATABASE_URL format: postgresql+asyncpg://user:password@host:port/database
+        # or postgresql://user:password@host:port/database
+        self.db_pool: Optional[asyncpg.Pool] = None
+        database_url = os.getenv("DATABASE_URL", "")
+        if database_url:
+            # Parse postgresql+asyncpg:// format to asyncpg connection string
+            # Remove the +asyncpg part and convert to asyncpg format
+            if "+asyncpg://" in database_url:
+                database_url = database_url.replace("+asyncpg://", "://")
+            # asyncpg uses postgresql:// format (also accepts postgres://)
+            if database_url.startswith(("postgresql://", "postgres://")):
+                self.database_url = database_url
+            else:
+                # Try to parse and reconstruct
+                parsed = urlparse(database_url)
+                if parsed.scheme in ["postgresql", "postgres"]:
+                    # Reconstruct with postgresql:// scheme for asyncpg
+                    self.database_url = f"postgresql://{parsed.netloc}{parsed.path}"
+                    if parsed.query:
+                        self.database_url += f"?{parsed.query}"
+                else:
+                    logger.warning(f"⚠️ Unsupported database URL format: {database_url}")
+                    self.database_url = None
+        else:
+            self.database_url = None
+            logger.info("ℹ️ DATABASE_URL not set, FNO underlying master data will be skipped")
         
         # Create API clients for each token
         self.api_clients: List[upstox_client.ApiClient] = []
@@ -971,6 +1001,133 @@ class DataService:
         
         return calculated_date
     
+    async def _get_db_pool(self) -> Optional[asyncpg.Pool]:
+        """Get or create database connection pool
+        
+        Returns:
+            asyncpg.Pool instance or None if database URL not configured
+        """
+        if not self.database_url:
+            return None
+        
+        if self.db_pool is None:
+            try:
+                # Parse connection string for asyncpg
+                # asyncpg expects: postgresql://user:password@host:port/database
+                self.db_pool = await asyncpg.create_pool(
+                    self.database_url,
+                    min_size=1,
+                    max_size=5,
+                    command_timeout=60
+                )
+                logger.info("✅ Created PostgreSQL connection pool")
+            except Exception as e:
+                logger.error(f"❌ Error creating database connection pool: {e}")
+                return None
+        
+        return self.db_pool
+    
+    async def _fetch_fno_underlying_data(self) -> List[Dict]:
+        """Fetch FNO underlying data from PostgreSQL database
+        
+        Returns:
+            List of dictionaries with instrument_key, trading_symbol, name, 
+            segment, instrument_type, tick_size
+        """
+        pool = await self._get_db_pool()
+        if not pool:
+            logger.warning("⚠️ Database pool not available, skipping FNO underlying data fetch")
+            return []
+        
+        try:
+            async with pool.acquire() as conn:
+                query = """
+                    SELECT 
+                        i.instrument_key, 
+                        i.trading_symbol, 
+                        i.name, 
+                        i.segment, 
+                        i.instrument_type, 
+                        i.tick_size 
+                    FROM public.instruments i 
+                    WHERE i.exchange = 'NSE' 
+                    AND EXISTS (
+                        SELECT 1 
+                        FROM public.instruments f 
+                        WHERE f.segment = 'NSE_FO' 
+                        AND f.underlying_symbol = i.trading_symbol
+                    ) 
+                    ORDER BY i.trading_symbol;
+                """
+                
+                rows = await conn.fetch(query)
+                
+                # Convert asyncpg.Record to dict
+                data = [dict(row) for row in rows]
+                
+                logger.info(f"✅ Fetched {len(data)} FNO underlying instruments from database")
+                return data
+                
+        except Exception as e:
+            logger.error(f"❌ Error fetching FNO underlying data from database: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
+    
+    def _cache_fno_underlying_data(self, fno_data: List[Dict]) -> None:
+        """Cache FNO underlying data in Redis
+        
+        Stores data with key format: fno_und:{trading_symbol}
+        
+        Args:
+            fno_data: List of dictionaries with FNO underlying instrument data
+        """
+        try:
+            cached_count = 0
+            for item in fno_data:
+                trading_symbol = item.get('trading_symbol')
+                if not trading_symbol:
+                    continue
+                
+                # Redis key: fno_und:{trading_symbol}
+                redis_key = f"fno_und:{trading_symbol}"
+                
+                # Store as JSON string
+                self.redis_client.set(
+                    redis_key,
+                    json.dumps(item),
+                    ex=86400 * 7  # 7 days TTL (master data, refresh daily)
+                )
+                cached_count += 1
+            
+            # Store update timestamp
+            self.redis_client.set(
+                "master_data:fno_underlying:updated_at",
+                format_ist_for_redis()
+            )
+            
+            logger.info(f"✅ Cached {cached_count} FNO underlying instruments in Redis")
+            
+        except Exception as e:
+            logger.error(f"❌ Error caching FNO underlying data: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    async def _update_fno_underlying_master_data(self) -> None:
+        """Update FNO underlying master data from database and cache in Redis"""
+        try:
+            logger.info("🔄 Updating FNO underlying master data...")
+            fno_data = await self._fetch_fno_underlying_data()
+            if fno_data:
+                self._cache_fno_underlying_data(fno_data)
+                logger.info(f"✅ FNO underlying master data update completed: {len(fno_data)} instruments")
+            else:
+                logger.warning("⚠️ No FNO underlying data fetched from database")
+        except Exception as e:
+            logger.error(f"❌ Error updating FNO underlying master data: {e}")
+            import traceback
+            traceback.print_exc()
+    
     async def daily_master_data_scheduler(self) -> None:
         """
         Background task: update master data (trading date) once per day at 8:00 AM IST.
@@ -1000,6 +1157,9 @@ class DataService:
                 trading_date = self._calculate_trading_date(current_timestamp)
                 self.current_trading_date = trading_date
                 self._update_trading_date_in_redis(trading_date)
+                
+                # Update FNO underlying master data
+                await self._update_fno_underlying_master_data()
                 
                 logger.info(f"✅ Scheduled master data update completed: trading_date={trading_date}")
                 
@@ -1561,6 +1721,17 @@ class DataService:
             return self.market_data_cache.get(instrument_key)
         return self.market_data_cache
     
+    async def _close_db_pool(self):
+        """Close database connection pool"""
+        if self.db_pool:
+            try:
+                await self.db_pool.close()
+                logger.info("✅ Closed PostgreSQL connection pool")
+            except Exception as e:
+                logger.error(f"❌ Error closing database pool: {e}")
+            finally:
+                self.db_pool = None
+    
     def stop(self):
         """Stop all streams across all streamers"""
         logger.info("Stopping all market data streamers...")
@@ -1715,6 +1886,12 @@ async def lifespan(app: FastAPI):
     # Initialize master data (trading date) - load from Redis or calculate
     data_service._get_or_init_trading_date()
     
+    # Initialize FNO underlying master data
+    try:
+        await data_service._update_fno_underlying_master_data()
+    except Exception as e:
+        logger.warning(f"⚠️ Could not initialize FNO underlying master data on startup: {e}")
+    
     # Get initial instruments from environment variable or use default
     instruments_env = os.getenv("INSTRUMENTS", "").strip()
     
@@ -1752,6 +1929,11 @@ async def lifespan(app: FastAPI):
     
     # Shutdown
     if data_service:
+        # Close database pool
+        try:
+            await data_service._close_db_pool()
+        except Exception as e:
+            logger.warning(f"⚠️ Error closing database pool during shutdown: {e}")
         data_service.stop()
     logger.info("Data service stopped")
 
