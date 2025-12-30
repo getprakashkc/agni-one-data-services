@@ -1103,13 +1103,9 @@ class DataService:
         """
         try:
             cached_count = 0
-            skipped_count = 0
-            sample_keys = []
-            
             for item in fno_data:
                 trading_symbol = item.get('trading_symbol')
                 if not trading_symbol:
-                    skipped_count += 1
                     continue
                 
                 # Redis key: fno_und:{trading_symbol}
@@ -1125,10 +1121,6 @@ class DataService:
                     ex=86400 * 7  # 7 days TTL (master data, refresh daily)
                 )
                 cached_count += 1
-                
-                # Collect sample keys for logging (first 5)
-                if len(sample_keys) < 5:
-                    sample_keys.append(redis_key)
             
             # Store update timestamp
             self.redis_client.set(
@@ -1136,21 +1128,7 @@ class DataService:
                 format_ist_for_redis()
             )
             
-            logger.info(
-                f"✅ Cached {cached_count} FNO underlying instruments in Redis "
-                f"(skipped {skipped_count} with missing trading_symbol)"
-            )
-            if sample_keys:
-                logger.info(f"📋 Sample Redis keys: {', '.join(sample_keys)}")
-            
-            # Verify a sample key exists in Redis
-            if sample_keys:
-                test_key = sample_keys[0]
-                test_value = self.redis_client.get(test_key)
-                if test_value:
-                    logger.info(f"✅ Verified: Key '{test_key}' exists in Redis (length: {len(test_value)} bytes)")
-                else:
-                    logger.warning(f"⚠️ Warning: Key '{test_key}' not found in Redis after caching!")
+            logger.info(f"✅ Cached {cached_count} FNO underlying instruments in Redis")
             
         except Exception as e:
             logger.error(f"❌ Error caching FNO underlying data: {e}")
