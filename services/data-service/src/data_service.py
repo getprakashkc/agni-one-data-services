@@ -1103,9 +1103,13 @@ class DataService:
         """
         try:
             cached_count = 0
+            skipped_count = 0
+            sample_keys = []
+            
             for item in fno_data:
                 trading_symbol = item.get('trading_symbol')
                 if not trading_symbol:
+                    skipped_count += 1
                     continue
                 
                 # Redis key: fno_und:{trading_symbol}
@@ -1121,6 +1125,10 @@ class DataService:
                     ex=86400 * 7  # 7 days TTL (master data, refresh daily)
                 )
                 cached_count += 1
+                
+                # Collect sample keys for logging (first 5)
+                if len(sample_keys) < 5:
+                    sample_keys.append(redis_key)
             
             # Store update timestamp
             self.redis_client.set(
@@ -1128,7 +1136,21 @@ class DataService:
                 format_ist_for_redis()
             )
             
-            logger.info(f"✅ Cached {cached_count} FNO underlying instruments in Redis")
+            logger.info(
+                f"✅ Cached {cached_count} FNO underlying instruments in Redis "
+                f"(skipped {skipped_count} with missing trading_symbol)"
+            )
+            if sample_keys:
+                logger.info(f"📋 Sample Redis keys: {', '.join(sample_keys)}")
+            
+            # Verify a sample key exists in Redis
+            if sample_keys:
+                test_key = sample_keys[0]
+                test_value = self.redis_client.get(test_key)
+                if test_value:
+                    logger.info(f"✅ Verified: Key '{test_key}' exists in Redis (length: {len(test_value)} bytes)")
+                else:
+                    logger.warning(f"⚠️ Warning: Key '{test_key}' not found in Redis after caching!")
             
         except Exception as e:
             logger.error(f"❌ Error caching FNO underlying data: {e}")
@@ -2201,6 +2223,46 @@ async def get_subscribed_instruments():
         "count": len(data_service.subscribed_instruments),
         "timestamp": format_ist_for_redis()
     }
+
+@app.get("/api/fno-underlying")
+async def get_fno_underlying(
+    trading_symbol: str = Query(None, description="Specific trading symbol to retrieve"),
+    limit: int = Query(50, description="Maximum number of results to return (when listing all)")
+):
+    """Get FNO underlying master data from Redis
+    
+    Returns data stored with key format: fno_und:{trading_symbol}
+    """
+    try:
+        if trading_symbol:
+            # Get specific trading symbol
+            redis_key = f"fno_und:{trading_symbol}"
+            data = data_service.redis_client.get(redis_key)
+            if data:
+                return json.loads(data.decode('utf-8'))
+            return {"error": f"No data found for trading_symbol: {trading_symbol}"}
+        else:
+            # List all FNO underlying keys
+            pattern = "fno_und:*"
+            keys = data_service.redis_client.keys(pattern)
+            
+            result = {
+                "count": len(keys),
+                "keys": [key.decode('utf-8') for key in keys[:limit]],
+                "sample_data": {}
+            }
+            
+            # Get sample data for first few keys
+            for key in keys[:min(5, limit)]:
+                key_str = key.decode('utf-8')
+                data = data_service.redis_client.get(key_str)
+                if data:
+                    result["sample_data"][key_str] = json.loads(data.decode('utf-8'))
+            
+            return result
+    except Exception as e:
+        logger.error(f"Error getting FNO underlying data: {e}")
+        return {"error": str(e)}
 
 @app.post("/api/instruments/subscribe")
 async def subscribe_instruments(request: InstrumentSubscribeRequest):
