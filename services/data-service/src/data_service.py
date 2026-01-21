@@ -2560,6 +2560,31 @@ async def admin_reload_tokens():
         "timestamp": format_ist_for_redis(),
     }
 
+@app.post("/api/admin/refresh-fno-underlying")
+async def admin_refresh_fno_underlying():
+    """
+    Admin endpoint: manually refresh FNO underlying master data from database
+    and update Redis cache. Useful after code changes or to get latest data.
+    """
+    global data_service
+
+    if data_service is None:
+        raise HTTPException(status_code=503, detail="DataService is not initialized")
+
+    try:
+        await data_service._update_fno_underlying_master_data()
+        return {
+            "status": "success",
+            "message": "FNO underlying master data refreshed successfully",
+            "timestamp": format_ist_for_redis(),
+        }
+    except Exception as e:
+        logger.error(f"Error refreshing FNO underlying data: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to refresh FNO underlying data: {e}",
+        )
+
 if __name__ == "__main__":
     port = int(os.getenv("DATA_SERVICE_PORT", "8001"))
     uvicorn.run(app, host="0.0.0.0", port=port)
