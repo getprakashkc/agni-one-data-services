@@ -1033,7 +1033,8 @@ class DataService:
         
         Returns:
             List of dictionaries with instrument_key, trading_symbol, name, 
-            segment, instrument_type, tick_size
+            segment, instrument_type, tick_size, and additional metadata
+            from instrument_nse_metadata for equity stocks
         """
         pool = await self._get_db_pool()
         if not pool:
@@ -1049,8 +1050,34 @@ class DataService:
                         i.name, 
                         i.segment, 
                         i.instrument_type, 
-                        i.tick_size 
+                        i.tick_size,
+                        -- Additional metadata from instrument_nse_metadata (for equity stocks)
+                        m.industry_macro,
+                        m.sector,
+                        m.industry,
+                        m.basic_industry,
+                        m.company_name,
+                        m.listing_date,
+                        m.primary_index,
+                        m.all_indices,
+                        m.trading_status,
+                        m.trading_segment,
+                        m.board_status,
+                        m.face_value,
+                        m.issued_size,
+                        m.sector_pe,
+                        m.symbol_pe,
+                        m.derivatives_available,
+                        m.slb_available,
+                        m.is_fno_sec,
+                        m.is_slb_sec,
+                        m.class_of_share,
+                        m.is_delisted,
+                        m.is_suspended
                     FROM public.instruments i 
+                    LEFT JOIN public.instrument_nse_metadata m 
+                        ON i.trading_symbol = m.trading_symbol 
+                        AND i.segment = 'NSE_EQ'
                     WHERE i.exchange = 'NSE' 
                     AND EXISTS (
                         SELECT 1 
