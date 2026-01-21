@@ -2205,6 +2205,7 @@ async def get_subscribed_instruments():
 @app.get("/api/fno-underlying")
 async def get_fno_underlying(
     trading_symbol: str = Query(None, description="Specific trading symbol to retrieve"),
+    segment: str = Query(None, description="Filter by segment (e.g., NSE_EQ, NSE_INDEX). Default: all segments"),
     limit: int = Query(50, description="Maximum number of results to return (when listing all)")
 ):
     """Get FNO underlying master data from Redis
@@ -2213,7 +2214,9 @@ async def get_fno_underlying(
     
     When listing all (no trading_symbol specified):
     - Returns full data for all keys up to the limit
+    - Use segment parameter to filter by segment (NSE_EQ, NSE_INDEX, etc.)
     - Use limit parameter to control how many results to return
+    - Default segment=None returns all segments
     """
     try:
         if trading_symbol:
@@ -2221,28 +2224,41 @@ async def get_fno_underlying(
             redis_key = f"fno_und:{trading_symbol}"
             data = data_service.redis_client.get(redis_key)
             if data:
-                return json.loads(data.decode('utf-8'))
+                instrument_data = json.loads(data.decode('utf-8'))
+                # Apply segment filter if provided
+                if segment and instrument_data.get('segment') != segment:
+                    return {"error": f"No data found for trading_symbol: {trading_symbol} with segment: {segment}"}
+                return instrument_data
             return {"error": f"No data found for trading_symbol: {trading_symbol}"}
         else:
             # List all FNO underlying keys
             pattern = "fno_und:*"
             keys = data_service.redis_client.keys(pattern)
             
-            # Limit the keys to process
-            limited_keys = keys[:limit]
-            
-            result = {
-                "count": len(keys),
-                "keys": [key.decode('utf-8') for key in limited_keys],
-                "data": {}
-            }
-            
-            # Get full data for all keys up to the limit
-            for key in limited_keys:
+            # Get full data for all keys first
+            all_data = {}
+            for key in keys:
                 key_str = key.decode('utf-8')
                 data = data_service.redis_client.get(key_str)
                 if data:
-                    result["data"][key_str] = json.loads(data.decode('utf-8'))
+                    instrument_data = json.loads(data.decode('utf-8'))
+                    # Filter by segment if provided
+                    if segment is None or instrument_data.get('segment') == segment:
+                        all_data[key_str] = instrument_data
+            
+            # Apply limit after filtering
+            limited_data = dict(list(all_data.items())[:limit])
+            
+            result = {
+                "count": len(all_data),  # Count after segment filtering
+                "total_count": len(keys),  # Total count before filtering
+                "keys": list(limited_data.keys()),
+                "data": limited_data
+            }
+            
+            # Add segment info if filtering
+            if segment:
+                result["segment"] = segment
             
             return result
     except Exception as e:
