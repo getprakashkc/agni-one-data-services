@@ -18,7 +18,7 @@ import uuid
 import requests
 from typing import Dict, List, Callable, Set, Tuple, Any, Optional
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 from decimal import Decimal
@@ -1103,16 +1103,18 @@ class DataService:
             return []
     
     def _convert_decimal_to_float(self, obj: Any) -> Any:
-        """Recursively convert Decimal values to float for JSON serialization
+        """Recursively convert Decimal, date, and datetime values for JSON serialization
         
         Args:
-            obj: Object that may contain Decimal values
+            obj: Object that may contain Decimal, date, or datetime values
             
         Returns:
-            Object with Decimal values converted to float
+            Object with Decimal values converted to float, and date/datetime to ISO format strings
         """
         if isinstance(obj, Decimal):
             return float(obj)
+        elif isinstance(obj, (date, datetime)):
+            return obj.isoformat()
         elif isinstance(obj, dict):
             return {key: self._convert_decimal_to_float(value) for key, value in obj.items()}
         elif isinstance(obj, list):
