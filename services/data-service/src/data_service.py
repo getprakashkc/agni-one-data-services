@@ -2210,6 +2210,10 @@ async def get_fno_underlying(
     """Get FNO underlying master data from Redis
     
     Returns data stored with key format: fno_und:{trading_symbol}
+    
+    When listing all (no trading_symbol specified):
+    - Returns full data for all keys up to the limit
+    - Use limit parameter to control how many results to return
     """
     try:
         if trading_symbol:
@@ -2224,18 +2228,21 @@ async def get_fno_underlying(
             pattern = "fno_und:*"
             keys = data_service.redis_client.keys(pattern)
             
+            # Limit the keys to process
+            limited_keys = keys[:limit]
+            
             result = {
                 "count": len(keys),
-                "keys": [key.decode('utf-8') for key in keys[:limit]],
-                "sample_data": {}
+                "keys": [key.decode('utf-8') for key in limited_keys],
+                "data": {}
             }
             
-            # Get sample data for first few keys
-            for key in keys[:min(5, limit)]:
+            # Get full data for all keys up to the limit
+            for key in limited_keys:
                 key_str = key.decode('utf-8')
                 data = data_service.redis_client.get(key_str)
                 if data:
-                    result["sample_data"][key_str] = json.loads(data.decode('utf-8'))
+                    result["data"][key_str] = json.loads(data.decode('utf-8'))
             
             return result
     except Exception as e:
