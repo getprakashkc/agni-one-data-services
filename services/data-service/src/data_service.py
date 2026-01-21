@@ -2235,7 +2235,7 @@ async def get_subscribed_instruments():
 async def get_fno_underlying(
     trading_symbol: str = Query(None, description="Specific trading symbol to retrieve"),
     segment: str = Query(None, description="Filter by segment (e.g., NSE_EQ, NSE_INDEX). Default: all segments"),
-    limit: int = Query(50, description="Maximum number of results to return (when listing all)")
+    limit: int = Query(50, description="Maximum number of results to return (when listing all). Use 0 to fetch all results.")
 ):
     """Get FNO underlying master data from Redis
     
@@ -2244,7 +2244,7 @@ async def get_fno_underlying(
     When listing all (no trading_symbol specified):
     - Returns full data for all keys up to the limit
     - Use segment parameter to filter by segment (NSE_EQ, NSE_INDEX, etc.)
-    - Use limit parameter to control how many results to return
+    - Use limit parameter to control how many results to return (0 = fetch all)
     - Default segment=None returns all segments
     """
     try:
@@ -2275,8 +2275,11 @@ async def get_fno_underlying(
                     if segment is None or instrument_data.get('segment') == segment:
                         all_data[key_str] = instrument_data
             
-            # Apply limit after filtering
-            limited_data = dict(list(all_data.items())[:limit])
+            # Apply limit after filtering (0 means fetch all)
+            if limit == 0:
+                limited_data = all_data
+            else:
+                limited_data = dict(list(all_data.items())[:limit])
             
             result = {
                 "count": len(all_data),  # Count after segment filtering
