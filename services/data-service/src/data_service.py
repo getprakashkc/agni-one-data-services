@@ -1471,7 +1471,15 @@ class DataService:
         websocket, subscriptions = self.subscribers[client_id]
         
         if action == "subscribe":
-            subscriptions.update(instruments)
+            # If subscribing to "*", replace all subscriptions with just "*"
+            if "*" in instruments:
+                subscriptions.clear()
+                subscriptions.add("*")
+            else:
+                # Remove "*" wildcard if it exists when subscribing to specific instruments
+                subscriptions.discard("*")
+                # Add the specific instruments
+                subscriptions.update(instruments)
             logger.info(f"Client {client_id} subscribed to: {instruments}")
         elif action == "unsubscribe":
             subscriptions.difference_update(instruments)
